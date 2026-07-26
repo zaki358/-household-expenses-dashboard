@@ -1,0 +1,57 @@
+# === 依存関係 ===
+node_modules/
+.venv-workers/
+
+# === ビルド成果物 ===
+dist/
+dist-ssr/
+
+# === Python ===
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# === ローカルDB・Wrangler実行時データ ===
+# backend/local.db, worker/.wrangler 配下のミニD1は実データを含むローカル専用ファイル。
+# 本番データは data/ からGitHub経由ではなく、会計フロー(kakei-check)でD1へ直接投入する。
+*.db
+*.sqlite
+*.sqlite3
+.wrangler/
+
+# === バックアップ ===
+# 反映前の原本保全用。個人の家計実データを含むため追跡しない。
+backend/backup/
+
+# === 家計実データ ===
+# 家賃・NISA金額など個人の実データを含むため公開リポジトリに上げない。
+# ディレクトリ自体は残す(空でもgit管理下に置きたい場合は .gitkeep を別途追加)。
+backend/data/
+
+# === ログ ===
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# === 環境変数・秘密情報 ===
+.env
+.env.*
+!.env.example
+.dev.vars
+
+# === エディタ・OS ===
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.local

@@ -1,0 +1,23 @@
+name = "kakei-dashboard"
+main = "worker.py"
+compatibility_date = "2025-06-01"
+compatibility_flags = ["python_workers"]
+
+# D1（SQLite）バインディング。database_id は `npx wrangler d1 create kakei-db`
+# 実行後に出力される値へ差し替える（登録後の受け渡しでオーナーが database_id を共有）。
+[[d1_databases]]
+binding = "DB"
+database_name = "kakei-db"
+database_id = "bfab2bb8-68e9-4800-a4d8-715c97c182d0"
+
+# 単一ホスト名構成: フロント(frontend/dist)を同じWorkerから配信し、
+# /api/* だけ Worker(FastAPI) を先に走らせる。それ以外は SPA フォールバック。
+[assets]
+directory = "../frontend/dist"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
+
+# Access 許可メール（多層防御 access_guard 用）。登録後に設定:
+#   npx wrangler secret put ACCESS_ALLOWED_EMAILS   （または下の [vars] に平文で）
+# [vars]
+# ACCESS_ALLOWED_EMAILS = "you@example.com,wife@example.com"

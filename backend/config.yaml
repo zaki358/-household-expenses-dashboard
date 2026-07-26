@@ -1,0 +1,51 @@
+wedding_fund:
+  target_amount: 3000000
+  source: savings
+investment_as_expense: true
+categories:
+  収入:
+  - 夫給与
+  - 妻給与
+  - ボーナス
+  - その他収入
+  固定費:
+  - 家賃
+  - 保険
+  - サブスク
+  インフラ:
+  - 電気
+  - ガス
+  - 水道
+  通信費:
+  - 通信費
+  変動費:
+  - 食費
+  - 消耗品
+  - 交際費
+  - 娯楽費
+  - 服
+  - 美容院
+  - 交通費
+  - 不明
+  車:
+  - ガソリン(車)
+  - 車保険
+  - 車税金
+  - 車検
+  - 車整備
+  バイク:
+  - ガソリン(バイク)
+  - バイク保険
+  - バイク税金
+  - バイク整備
+  投資:
+  - NISA
+  - 投資信託
+  - 株式
+  - その他投資
+income_owner:
+  夫給与: 夫
+  妻給与: 妻
+dashboard_months: []
+goals: []
+active_goal: null

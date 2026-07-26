@@ -1,0 +1,139 @@
+/*
+ * Global stylesheet for the kakei-dashboard-2 design system.
+ * Mirrors the tokens defined in src/theme/tokens.ts.
+ * Source spec: C:\Users\barub\company\kakei-dashboard-2\DESIGN.md
+ *
+ * Font note: PlayStation SST is proprietary and unavailable. Per the
+ * documented substitute guidance this app uses Roboto Light (300) for the
+ * display tier and Inter (400/500/600) for body/chrome. The font files are
+ * loaded via Google Fonts <link> tags in index.html (kept out of this CSS
+ * file so the font request can be preconnected/discovered early by the
+ * browser before CSS is parsed).
+ */
+
+@import "tailwindcss";
+@config "../../tailwind.config.ts";
+
+:root {
+  /* Brand & Accent */
+  --color-primary: #0070d1;
+  --color-primary-pressed: #0064b7;
+  --color-primary-active: #004d8d;
+  /* Commerce orange tokens are defined for completeness but UNUSED in this
+     app — no commerce/store flow. Do not wire into default components. */
+  --color-commerce: #d53b00;
+  --color-commerce-pressed: #aa2f00;
+  --color-marathon-yellow: #deff20;
+
+  /* Surface */
+  --color-canvas-dark: #000000;
+  --color-surface-dark-elevated: #121314;
+  --color-surface-dark-card: #181818;
+  --color-canvas-light: #ffffff;
+  --color-surface-soft: #f3f3f3;
+  --color-surface-card: #f5f7fa;
+  --color-surface-filter: rgba(245, 247, 250, 0.3);
+  --color-hairline-light: #f3f3f3;
+  --color-hairline-dark: rgba(229, 229, 229, 0.2);
+
+  /* Text */
+  --color-ink: #000000;
+  --color-ink-deep: #121314;
+  --color-ink-elevated: #181818;
+  --color-body-light: rgba(0, 0, 0, 0.6);
+  --color-mute-light: #6b6b6b;
+  --color-ash-light: #cccccc;
+  --color-on-dark: #ffffff;
+  --color-body-dark: rgba(255, 255, 255, 0.7);
+  --color-on-dark-mute: #cccccc;
+  --color-mute-dark: #d4d4d4;
+
+  /* Semantic */
+  --color-warning: #c81b3a;
+  --color-link-light: #0064b7;
+  --color-link-dark: #53b1ff;
+
+  /* Brand gradient — PlayStation Plus banner only */
+  --color-ps-plus-gold-start: #ffce21;
+  --color-ps-plus-gold-mid: #f5a623;
+  --color-ps-plus-gold-end: #ee8e00;
+
+  /* Categorical chart palette (Recharts) — see DESIGN.md mapping notes */
+  --chart-lead: var(--color-primary);
+  --chart-tonal-1: var(--color-link-dark);
+  --chart-tonal-2: var(--color-mute-light);
+  --chart-tonal-3: var(--color-ash-light);
+  --chart-negative: var(--color-warning);
+
+  /* Typography */
+  --font-display: 'Roboto', Arial, Helvetica, sans-serif;
+  --font-body: 'Inter', Arial, Helvetica, sans-serif;
+
+  /* Spacing (8px base unit, 96px section rhythm) */
+  --spacing-xxs: 4px;
+  --spacing-xs: 8px;
+  --spacing-sm: 12px;
+  --spacing-md: 16px;
+  --spacing-lg: 24px;
+  --spacing-xl: 32px;
+  --spacing-xxl: 48px;
+  --spacing-section: 96px;
+
+  /* Border radius scale */
+  --rounded-none: 0px;
+  --rounded-sm: 4px;
+  --rounded-md: 8px;
+  --rounded-lg: 16px;
+  --rounded-full: 9999px;
+}
+
+/*
+ * Base reset — MUST live inside `@layer base`.
+ *
+ * Tailwind v4 emits all utilities inside `@layer utilities`. Per the CSS
+ * cascade, an UNLAYERED declaration beats ANY layered one regardless of
+ * specificity, so an unlayered `* { margin: 0; padding: 0 }` here would
+ * silently override every margin/padding utility (mt-*, mx-auto, p-*, py-*),
+ * leaving only `gap-*` and `!important` spacing alive. That made the whole
+ * layout collapse to a cramped, un-centerable column. Keeping the reset in
+ * `@layer base` lets utilities (a later layer) win as intended.
+ */
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+
+  body {
+    font-family: var(--font-body);
+    color: var(--color-on-dark);
+    background-color: var(--color-canvas-dark);
+    line-height: 1.8;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  img,
+  picture,
+  video {
+    display: block;
+    max-width: 100%;
+  }
+
+  button {
+    font-family: inherit;
+    cursor: pointer;
+  }
+
+  a {
+    color: inherit;
+  }
+}

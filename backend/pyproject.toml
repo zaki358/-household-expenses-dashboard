@@ -1,0 +1,20 @@
+[project]
+name = "kakei-dashboard-backend"
+version = "0.1.0"
+description = "家計ダッシュボード3 バックエンド（FastAPI on Cloudflare Python Workers）"
+requires-python = ">=3.12"
+# デプロイ用の実行時依存のみ。pandas/numpy/yaml は使わない＝Workers 可搬。
+dependencies = [
+    "fastapi",
+    "pydantic",
+]
+
+[dependency-groups]
+# ローカル開発・テスト用（Workers には載せない）。
+dev = [
+    "pytest",
+    "httpx",
+    "uvicorn[standard]",
+]
+
+# Python Workers デプロイ: `uv run pywrangler deploy`（wrangler.toml を参照）
