@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>家計ダッシュボード3 技術構成</title>
+<link rel="stylesheet" href="docs.css">
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1>家計ダッシュボード3 — 仕様・設計・技術構成</h1>
+  <p>夫婦の家計を月単位で集計・可視化するWebアプリ。Cloudflare Workers 上で API と SPA を1つの Worker から配信し、データは D1 に置く。同じロジックが TypeScript と Python の2言語で二重に実装されているのが最大の特徴。</p>
+  <div class="badges">
+    <span class="badge">TypeScript 5.7 / 6.0</span>
+    <span class="badge">Python 3.12+</span>
+    <span class="badge">React 19</span>
+    <span class="badge">Hono 4</span>
+    <span class="badge">FastAPI</span>
+    <span class="badge">Vite 8</span>
+    <span class="badge">Tailwind CSS 4</span>
+    <span class="badge">Recharts 3</span>
+    <span class="badge">Cloudflare Workers + D1</span>
+  </div>
+  <p class="subnav">
+    姉妹編: <a href="warikan-integration.html">割り勘アプリ連携の詳細</a> — 家計簿から割り勘アプリへ支出を反映する仕組みの説明書。
+  </p>
+  <nav class="toc">
+    <ol>
+      <li><a href="#what">このアプリは何をするものか</a></li>
+      <li><a href="#dual">最重要の構造 — バックエンドが2系統ある</a></li>
+      <li><a href="#lang">使用している言語</a></li>
+      <li><a href="#tree">フォルダ構成</a></li>
+      <li><a href="#db">データベース（Cloudflare D1）</a></li>
+      <li><a href="#logic">集計ロジック</a></li>
+      <li><a href="#api">API エンドポイント</a></li>
+      <li><a href="#front">フロントエンド構成</a></li>
+      <li><a href="#libs">ライブラリとフレームワーク</a></li>
+      <li><a href="#tools">ツール・実行環境・コマンド</a></li>
+      <li><a href="#tests">テスト</a></li>
+      <li><a href="#rules">設計上の制約と運用ルール</a></li>
+    </ol>
+  </nav>
+</header>
+
+<!-- ============================================================ -->
+<section id="what">
+  <h2>1. このアプリは何をするものか</h2>
+  <p class="lead">夫婦2人の家計を <strong>月（<code>YYYY-MM</code>）単位</strong> で記録し、KPI・グラフ・貯蓄目標として見せる。データの最小単位は「ある月の、あるカテゴリに、いくら使ったか」の1行。</p>
+
+  <div class="grid">
+    <div class="card web">
+      <h3>ダッシュボード</h3>
+      <span class="path">features/dashboard/Dashboard.tsx</span>
+      <p>選択した月の KPI（収入・支出・貯金・純資産など）と前月比較。</p>
+      <ul>
+        <li>数値は必ず product-card の中に置く</li>
+        <li>前月が無い月は比較を出さない</li>
+      </ul>
+    </div>
+    <div class="card web">
+      <h3>グラフ</h3>
+      <span class="path">features/charts/ChartsTab.tsx</span>
+      <p>支出の円グラフ、グループ別の棒グラフ（当月／前月）、資産推移の折れ線、貯金額の棒。</p>
+      <ul>
+        <li>Recharts。重いので動的 import で分割</li>
+      </ul>
+    </div>
+    <div class="card web">
+      <h3>入力</h3>
+      <span class="path">features/entry/EntryTab.tsx</span>
+      <p>9つのサブタブ（変動費・収入・固定費・インフラ・通信費・サブスク・車・バイク・投資）でのCRUD。アプリを開いた直後の既定タブ。</p>
+      <ul>
+        <li>変動費・車・バイク・投資は「日」も任意入力できる</li>
+        <li>通信費・サブスクだけは別テーブル（bundle_items）</li>
+        <li>割り勘アプリへの反映ボタンもここ</li>
+      </ul>
+    </div>
+    <div class="card web">
+      <h3>目標</h3>
+      <span class="path">features/goal/GoalTab.tsx</span>
+      <p>貯蓄目標の登録と達成状況。直近6か月のペースから達成予想月を出す。</p>
+    </div>
+    <div class="card web">
+      <h3>設定</h3>
+      <span class="path">features/settings/SettingsTab.tsx</span>
+      <p>カテゴリの追加・削除、投資の扱い（支出に含めるか）、CSV取込・書き出し、翌月シートの作成、月の削除。</p>
+    </div>
+  </div>
+
+  <div class="note">
+    <strong>月が主役で、日は脇役</strong>
+    集計・グラフ・目標はすべて月単位。<code>entries.day</code> は後から足した任意項目で、一覧の並べ替えと割り勘アプリへの反映にしか使わない。日が無いエントリがあっても集計は壊れない。
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="dual">
+  <h2>2. 最重要の構造 — バックエンドが2系統ある</h2>
+  <p class="lead">このリポジトリには<strong>同一ロジックの独立した2実装</strong>がある。片方だけ直すとAPIの挙動がずれるため、常に同期させる。</p>
+
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr><th></th><th><code>worker/</code>（TypeScript）</th><th><code>backend/</code>（Python）</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>フレームワーク</td><td>Hono 4</td><td>FastAPI</td></tr>
+        <tr><td>実行環境</td><td>Cloudflare Workers</td><td>ローカルのみ（uvicorn）</td></tr>
+        <tr><td>DB</td><td>本番 D1（<code>kakei-db</code>）</td><td><code>backend/local.db</code>（SQLite）</td></tr>
+        <tr><td>役割</td><td><strong>本番稼働</strong></td><td>ローカル開発・テスト用サンドボックス</td></tr>
+        <tr><td>テスト</td><td>vitest（3ファイル）</td><td>pytest（15ファイル）</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>2-1. モジュールの対応</h3>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Python</th><th>TypeScript</th><th>役割</th></tr></thead>
+      <tbody>
+        <tr><td><code>backend/src/repo.py</code></td><td><code>worker/src/repo.ts</code></td><td>全SQLアクセス。検証もここ</td></tr>
+        <tr><td><code>backend/src/aggregate.py</code></td><td><code>worker/src/aggregate.ts</code></td><td>月次集計・KPI・前月比較</td></tr>
+        <tr><td><code>backend/src/goal.py</code></td><td><code>worker/src/goal.ts</code></td><td>目標の達成率と達成予想月</td></tr>
+        <tr><td><code>backend/src/importer.py</code> / <code>exporter.py</code></td><td><code>worker/src/importer.ts</code> / <code>exporter.ts</code></td><td>CSV取込・書き出し</td></tr>
+        <tr><td><code>backend/src/dates.py</code></td><td><code>worker/src/dates.ts</code></td><td>年月の正規化・加算・末日</td></tr>
+        <tr><td><code>backend/api/routers/*.py</code></td><td><code>worker/src/index.ts</code></td><td>HTTP層。TS版は全ルートが1ファイル</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="lead"><code>worker/src/repo.ts</code> のコメントに「Python版 <code>src/repo.py</code> の移植」と明記されている。API契約（パス・JSONの形）は両者で完全に同一。</p>
+
+  <h3>2-2. 唯一の例外 — 割り勘アプリ連携</h3>
+  <p>Cloudflare の Service Binding（Worker→Worker の直接呼び出し）を使うため、FastAPI では原理的に実装できない。以下は <code>worker/</code> にしか存在しない。</p>
+  <ul>
+    <li><code>worker/src/warikan.ts</code>（連携クライアント）、<code>worker/src/errors.ts</code></li>
+    <li><code>GET /api/warikan/status</code>、<code>GET /api/warikan/users</code>、<code>POST /api/entries/{id}/warikan</code>、<code>DELETE /api/entries/{id}/warikan</code></li>
+  </ul>
+  <p>ただし <code>entries.warikan_expense_id</code> 列と <code>/api/entries</code> のJSONの形（<code>割り勘ID</code> キー）は両系統で同期している。詳細は <a href="warikan-integration.html">割り勘アプリ連携の説明書</a>。</p>
+
+  <div class="note">
+    <strong>なぜ2つあるのか</strong>
+    もともと Python（FastAPI）版だけだった。本番を Cloudflare Workers に載せる際、当時の Python Workers では実用に耐えなかったため TypeScript に移植した。Python版はローカルで素早く試すためのサンドボックスとして残っている。<code>backend/worker.py</code> と <code>backend/wrangler.toml</code> は廃止された Python Workers デプロイ経路の名残で、現在は未使用。
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="lang">
+  <h2>3. 使用している言語</h2>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>言語</th><th>使用箇所</th><th>備考</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>TypeScript</strong></td>
+          <td><code>worker/src</code>（本番API）、<code>frontend/src</code></td>
+          <td>worker は TS 5.7、frontend は TS 6.0。どちらも <code>tsc</code> は型検査専用（<code>noEmit</code> / <code>tsc -b</code>）でビルドは Vite・wrangler が行う</td>
+        </tr>
+        <tr>
+          <td><strong>TSX (JSX)</strong></td>
+          <td><code>frontend/src</code> の React コンポーネント</td>
+          <td>React 19 の自動 JSX ランタイム</td>
+        </tr>
+        <tr>
+          <td><strong>Python</strong></td>
+          <td><code>backend/</code>（ローカル開発用API）</td>
+          <td>3.12 以上。実行時依存は fastapi と pydantic だけ（pandas・numpy・yaml は使わない）</td>
+        </tr>
+        <tr>
+          <td><strong>SQL</strong></td>
+          <td><code>worker/migrations/*.sql</code>、<code>backend/migrations/*.sql</code></td>
+          <td>SQLite 方言。金額はすべて <code>INTEGER</code>（円）。2つのディレクトリの中身は同一</td>
+        </tr>
+        <tr>
+          <td><strong>CSS</strong></td>
+          <td><code>frontend/src/theme/global.css</code>、<code>index.css</code></td>
+          <td>Tailwind CSS 4 のCSS-first設定（<code>@theme</code>）。デザイントークンは <code>theme/tokens.ts</code> と二重管理</td>
+        </tr>
+        <tr>
+          <td><strong>HTML</strong></td>
+          <td><code>frontend/index.html</code></td>
+          <td>Vite のエントリ。PWA の manifest とアイコンを参照</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="tree">
+  <h2>4. フォルダ構成</h2>
+<pre><code><span class="d">kakei-dashboard-3/</span>
+├── CLAUDE.md               # 開発者（と Claude Code）向けの作業ガイド
+├── DESIGN.md               # デザイン仕様。UI変更前に必ず読む正式な仕様書
+├── README.md               # 概要と v1/v2/v3 の系統
+├── ROLLBACK_warikan.md     # 割り勘連携の戻し方（段階1〜4）
+├── 起動.bat                # FastAPI と Vite をまとめて起動
+│
+├── <span class="d">docs/</span>                   # このドキュメント群
+│   ├── docs.css
+│   ├── tech-stack.html
+│   └── warikan-integration.html
+│
+├── <span class="d">frontend/</span>               # React 19 + Vite 8 + Tailwind 4
+│   ├── index.html
+│   ├── tailwind.config.ts  # tokens.ts をTailwindのテーマに写したもの
+│   ├── vite.config.ts      # vitest(jsdom)の設定も兼ねる
+│   ├── <span class="d">public/</span>             # PWA manifest とアイコン
+│   └── <span class="d">src/</span>
+│       ├── App.tsx         # タブのシェル（5タブ）＋月セレクタ
+│       ├── <span class="d">features/</span>       # タブごと。dashboard / charts / entry / goal / settings
+│       ├── <span class="d">charts/</span>         # Recharts ラッパー4種＋配色
+│       ├── <span class="d">components/</span>     # デザインシステムのプリミティブ
+│       ├── <span class="d">api/</span>            # client.ts（fetchラッパー）/ types.ts
+│       ├── <span class="d">hooks/</span>          # useApiResource
+│       ├── <span class="d">theme/</span>          # tokens.ts / global.css
+│       └── <span class="d">utils/</span>          # currency / dates / expenseSummary
+│
+├── <span class="d">worker/</span>                 # ★本番バックエンド（Hono on Workers）
+│   ├── wrangler.toml       # D1バインディング / [assets] / Service Binding
+│   ├── <span class="d">migrations/</span>         # 0001_init 〜 0005_add_entry_warikan_id
+│   ├── <span class="d">src/</span>
+│   │   ├── index.ts        # 全ルート（32本）＋ Access ガード
+│   │   ├── repo.ts         # 全SQLアクセス（723行）
+│   │   ├── aggregate.ts    # 月次集計
+│   │   ├── goal.ts         # 目標
+│   │   ├── importer.ts / exporter.ts
+│   │   ├── dates.ts / db.ts / errors.ts
+│   │   └── warikan.ts      # 割り勘アプリ連携クライアント
+│   └── <span class="d">tests/</span>              # node:sqlite に実マイグレーションを当てて repo を直接検証
+│
+└── <span class="d">backend/</span>                # ローカル開発用バックエンド（FastAPI）
+    ├── main.py
+    ├── <span class="d">api/</span>                # routers/*.py（薄いHTTP層）/ schemas.py / deps.py
+    ├── <span class="d">src/</span>                # worker/src と同名のモジュール群
+    ├── <span class="d">migrations/</span>         # worker/migrations と同一内容
+    ├── <span class="d">tests/</span>              # pytest 15ファイル
+    ├── <span class="d">scripts/</span>            # csv_to_sql.py（月次データ投入用）
+    ├── <span class="d">data/</span>               <span class="gen">gitignore（実データのCSV）</span>
+    └── <span class="d">backup/</span>             <span class="gen">gitignore（原本・DBエクスポート）</span>
+</code></pre>
+
+  <div class="note">
+    <strong>gitignore されているもの</strong>
+    <code>backend/data/</code>（家賃・投資額などの実データ）、<code>backend/backup/</code>、<code>*.db</code> / <code>*.sqlite</code>、<code>.wrangler/</code>、<code>.dev.vars</code>、<code>frontend/dist</code>。clone 直後は <code>backend/data/</code> が空になるので、ローカル開発では自分でCSV（<code>年月,カテゴリ,金額</code> の3列）を用意する。
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="db">
+  <h2>5. データベース（Cloudflare D1）</h2>
+  <p class="lead">本番は D1 の <code>kakei-db</code>（binding は <code>DB</code>）。<strong>正本はD1であって <code>backend/data/</code> のCSVではない</strong> — CSVを直しただけでは本番に反映されない。</p>
+
+  <h3>5-1. テーブル</h3>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>テーブル</th><th>主なカラム</th><th>役割</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>entries</code></td>
+          <td><code>id, month, category, amount, source, created_at, note, day, warikan_expense_id</code></td>
+          <td>家計の1行。<code>month</code> は <code>GLOB</code> で <code>YYYY-MM</code> を強制、<code>amount &gt; 0</code>。<code>source</code> は <code>manual</code> か <code>import</code> で、編集できるのは manual だけ</td>
+        </tr>
+        <tr>
+          <td><code>bundle_items</code></td>
+          <td><code>id, kind, month, name, amount</code></td>
+          <td>サブスク・通信費の内訳。<code>kind</code> は <code>subscriptions</code>/<code>communications</code>。<code>(kind, month, name)</code> が UNIQUE。集計時は1カテゴリに畳まれる</td>
+        </tr>
+        <tr>
+          <td><code>category_groups</code></td>
+          <td><code>name, sort_order</code></td>
+          <td>8グループ（収入・固定費・インフラ・通信費・変動費・車・バイク・投資）。入力タブのサブタブ名と一致する</td>
+        </tr>
+        <tr>
+          <td><code>categories</code></td>
+          <td><code>name, group_name, income_owner, sort_order</code></td>
+          <td>30カテゴリ。<code>income_owner</code> は夫／妻で、収入の内訳表示に使う</td>
+        </tr>
+        <tr>
+          <td><code>goals</code></td>
+          <td><code>name, target_amount, source, sort_order</code></td>
+          <td>貯蓄目標。<code>source</code> は <code>savings</code>（累計貯金）か <code>net_worth</code>（純資産）</td>
+        </tr>
+        <tr>
+          <td><code>app_settings</code></td>
+          <td><code>key, value</code></td>
+          <td>今は <code>investment_as_expense</code> と <code>active_goal</code> だけ</td>
+        </tr>
+        <tr>
+          <td><code>dashboard_months</code></td>
+          <td><code>month</code></td>
+          <td>データが0件でも月セレクタに出したい月。翌月シート作成で使う</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>5-2. マイグレーション</h3>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>ファイル</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td><code>0001_init.sql</code></td><td>7テーブルの作成</td></tr>
+        <tr><td><code>0002_seed.sql</code></td><td>8グループ・30カテゴリ・初期設定の投入</td></tr>
+        <tr><td><code>0003_add_entry_note.sql</code></td><td><code>entries.note</code>（詳細）。空欄は許すが NULL は使わない方針で <code>NOT NULL DEFAULT ''</code></td></tr>
+        <tr><td><code>0004_add_entry_day.sql</code></td><td><code>entries.day</code>（日）。NULL = 日付なし。月末日との整合はDBではなくアプリ側で検証</td></tr>
+        <tr><td><code>0005_add_entry_warikan_id.sql</code></td><td><code>entries.warikan_expense_id</code>。割り勘アプリへの反映先ID。NULL = 未反映</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="lead"><code>worker/migrations/</code> と <code>backend/migrations/</code> は<strong>バイト単位で同一</strong>。worker のテストは <code>node:sqlite</code> のインメモリDBにこのSQLを実際に適用して走るので、本番と同じスキーマで検証される。</p>
+
+  <div class="warn">
+    <strong>--remote と --local を取り違えない</strong>
+    <code>npx wrangler d1 execute kakei-db --remote</code> は本番、<code>--local</code> は開発用。削除は必ず <code>WHERE month IN (...)</code> で範囲を限定する。
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="logic">
+  <h2>6. 集計ロジック</h2>
+
+  <h3>6-1. 月次サマリー（<code>monthlySummary</code>）</h3>
+  <p>すべてのエントリを月ごとに畳んで、1行 = 1か月の表を作る。ダッシュボード・グラフ・目標はすべてこの表から導かれる。</p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>列</th><th>意味</th></tr></thead>
+      <tbody>
+        <tr><td><code>収入</code></td><td>グループ「収入」の合計</td></tr>
+        <tr><td><code>夫収入</code> / <code>妻収入</code></td><td><code>categories.income_owner</code> で振り分けた内訳</td></tr>
+        <tr><td><code>支出</code></td><td>収入以外の合計。<code>investment_as_expense</code> が false なら投資を除く</td></tr>
+        <tr><td><code>投資</code></td><td>グループ「投資」の合計</td></tr>
+        <tr><td><code>貯金</code></td><td>収入 − 支出</td></tr>
+        <tr><td><code>累計貯金</code></td><td>貯金の累積</td></tr>
+        <tr><td><code>投資累計</code></td><td>投資の累積</td></tr>
+        <tr><td><code>純資産</code></td><td>累計貯金 + 投資累計</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="lead"><code>investment_as_expense</code>（設定タブで切替）が、投資を「支出」に数えるかどうかを決める。これにより「貯金」の意味が変わるため、グラフも目標も一斉に変わる。</p>
+
+  <h3>6-2. 目標（<code>goalStatus</code>）</h3>
+  <ol class="flow">
+    <li><span class="title">現在額を取る</span><p class="body">目標の <code>source</code> が <code>net_worth</code> なら最新月の <code>純資産</code>、そうでなければ <code>累計貯金</code>。</p></li>
+    <li><span class="title">達成率と残額</span><p class="body">達成率は 0〜100% にクランプ。残額は負にならない。</p></li>
+    <li><span class="title">ペースを出す</span><p class="body"><strong>直近6か月</strong>（<code>PACE_WINDOW_MONTHS</code>）の月次の積み増し（貯金、純資産目標なら 貯金+投資）の平均。</p></li>
+    <li><span class="title">達成予想月</span><p class="body">残額 ÷ ペースを切り上げた月数を最新月に足す。ペースが0以下なら <code>null</code>（予想不能）。</p></li>
+  </ol>
+
+  <h3>6-3. 年月の正規化（<code>dates.normalizeMonth</code>）</h3>
+  <p>CSV取込で人間が書いた表記を吸収する。空欄なら今月、<code>1</code>〜<code>12</code> の数字だけなら今年のその月、<code>2026年6月</code> / <code>2026/6</code> / <code>2026-6</code> はすべて <code>2026-06</code> になる。解釈できなければ例外。</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="api">
+  <h2>7. API エンドポイント</h2>
+  <p class="lead"><code>/api/*</code> は Worker（Hono）が処理し、それ以外は <code>[assets]</code> が SPA を返す（<code>run_worker_first = ["/api/*"]</code>）。エラーは FastAPI 互換の <code>{"detail": "..."}</code> で返す。</p>
+
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>メソッド</th><th>パス</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr><td><span class="method get">GET</span></td><td><code>/api/health</code></td><td>疎通確認</td></tr>
+        <tr><td><span class="method get">GET</span></td><td><code>/api/summary</code></td><td>全月サマリー・警告・当月</td></tr>
+        <tr><td><span class="method get">GET</span></td><td><code>/api/dashboard?month=</code></td><td>選択月のKPIと前月比較</td></tr>
+        <tr><td><span class="method get">GET</span></td><td><code>/api/charts?month=</code></td><td>円グラフ・棒グラフ・資産推移のデータ</td></tr>
+        <tr><td><span class="method get">GET</span></td><td><code>/api/entries?month=&amp;group=</code></td><td>手入力エントリ一覧（<code>source='manual'</code> のみ）</td></tr>
+        <tr><td><span class="method post">POST</span></td><td><code>/api/entries</code></td><td>追加。レスポンスは更新後の全件配列</td></tr>
+        <tr><td><span class="method patch">PUT</span></td><td><code>/api/entries/{id}</code></td><td>更新。<code>day</code> は未送信＝触らない／<code>null</code>＝クリア</td></tr>
+        <tr><td><span class="method delete">DELETE</span></td><td><code>/api/entries/{id}</code></td><td>削除。割り勘に反映済みなら409</td></tr>
+        <tr><td><span class="method get">GET</span></td><td><code>/api/warikan/status</code></td><td>割り勘連携が有効か（<strong>Worker専用</strong>）</td></tr>
+        <tr><td><span class="method get">GET</span></td><td><code>/api/warikan/users</code></td><td>支払者の候補（<strong>Worker専用</strong>）</td></tr>
+        <tr><td><span class="method post">POST</span></td><td><code>/api/entries/{id}/warikan</code></td><td>割り勘へ反映（<strong>Worker専用</strong>）</td></tr>
+        <tr><td><span class="method delete">DELETE</span></td><td><code>/api/entries/{id}/warikan</code></td><td>反映の取り消し（<strong>Worker専用</strong>）</td></tr>
+        <tr><td><span class="method get">GET</span></td><td><code>/api/bundles/{kind}</code></td><td>サブスク／通信費の内訳</td></tr>
+        <tr><td><span class="method post">POST</span></td><td><code>/api/bundles/{kind}</code></td><td>内訳の追加</td></tr>
+        <tr><td><span class="method patch">PUT</span></td><td><code>/api/bundles/{kind}/{id}</code></td><td>内訳の更新</td></tr>
+        <tr><td><span class="method delete">DELETE</span></td><td><code>/api/bundles/{kind}/{id}</code></td><td>内訳の削除</td></tr>
+        <tr><td><span class="method get">GET</span></td><td><code>/api/goals</code> / <code>/api/goals/status</code></td><td>目標の一覧／達成状況</td></tr>
+        <tr><td><span class="method post">POST</span></td><td><code>/api/goals</code></td><td>目標の追加</td></tr>
+        <tr><td><span class="method delete">DELETE</span></td><td><code>/api/goals/{name}</code></td><td>目標の削除</td></tr>
+        <tr><td><span class="method patch">PUT</span></td><td><code>/api/goals/active</code></td><td>表示する目標の切替</td></tr>
+        <tr><td><span class="method post">POST</span></td><td><code>/api/months/next</code></td><td>翌月シート作成（固定費・サブスクを引き継ぐ）</td></tr>
+        <tr><td><span class="method post">POST</span></td><td><code>/api/months/ensure-current</code></td><td>当月シートが無ければ作る（アプリ起動時に自動）</td></tr>
+        <tr><td><span class="method delete">DELETE</span></td><td><code>/api/months/{month}</code></td><td>月まるごと削除</td></tr>
+        <tr><td><span class="method get">GET</span></td><td><code>/api/config</code></td><td>カテゴリ・設定・使用件数</td></tr>
+        <tr><td><span class="method patch">PUT</span></td><td><code>/api/config/investment-mode</code></td><td>投資を支出に含めるかの切替</td></tr>
+        <tr><td><span class="method post">POST</span></td><td><code>/api/config/categories</code></td><td>カテゴリ追加</td></tr>
+        <tr><td><span class="method delete">DELETE</span></td><td><code>/api/config/categories/{name}</code></td><td>カテゴリ削除（保護あり・後述）</td></tr>
+        <tr><td><span class="method post">POST</span></td><td><code>/api/import/csv?dry_run=</code></td><td>CSV取込（dry-runでプレビュー）</td></tr>
+        <tr><td><span class="method get">GET</span></td><td><code>/api/export/entries.csv</code></td><td>エントリのCSV書き出し</td></tr>
+        <tr><td><span class="method get">GET</span></td><td><code>/api/export/bundles/{kind}.csv</code></td><td>内訳のCSV書き出し</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note">
+    <strong>レスポンスの約束</strong>
+    エントリとバンドルの変更系（POST/PUT/DELETE）は、<strong>更新後の全件配列</strong>を返す。ただしフロントは絞り込み条件（月・グループ）を知っているので、戻り値をそのまま画面に出さず <code>GET</code> で取り直す。この約束を破ると、変動費タブに家賃が混ざるようなバグになる。
+  </div>
+
+  <h3>認証</h3>
+  <p>本番は Cloudflare Access で保護されている。多層防御として、<code>ACCESS_ALLOWED_EMAILS</code> が設定されていれば Worker 側でも <code>Cf-Access-Authenticated-User-Email</code> ヘッダを許可リストと突き合わせる（<code>worker/src/index.ts</code> のミドルウェア）。未設定なら素通し＝ローカル開発用。</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="front">
+  <h2>8. フロントエンド構成</h2>
+
+  <h3>8-1. 画面の骨格</h3>
+  <p><code>App.tsx</code> がタブのシェル。5タブ（ダッシュボード／グラフ／入力／目標／設定）＋月セレクタ。デスクトップは上部ナビ、スマホは下部固定タブバー（<code>z-50</code>）。既定タブは<strong>入力</strong>（最も使う画面のため）。</p>
+
+  <h3>8-2. デザインシステム</h3>
+  <p><code>DESIGN.md</code>（PlayStationのマーケティングサイトから抽出したトークン体系）に準拠する。<strong>参考ではなく正式な仕様</strong>で、UI変更の前に必ず読む。</p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>決まり</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td>タブ＝バンド</td><td>各タブはフルブリードのバンドを縦に積む（ダーク／ライト交互）</td></tr>
+        <tr><td>KPI</td><td>裸の数字は置かず、必ず <code>product-card</code>（8px角丸）の中に入れる</td></tr>
+        <tr><td>目標タブ</td><td><code>hero-band-blue</code> を主コンテナに使う（「達成の瞬間」の表現）</td></tr>
+        <tr><td>CTA</td><td>すべて <code>button-primary</code> のピル。このアプリに commerce（オレンジ）CTAは存在しない</td></tr>
+        <tr><td>フォント</td><td>見出しは Roboto Light 300、本文・UIは Inter 400/500/600（PlayStation SST は非公開のため代替）</td></tr>
+        <tr><td>グラフ配色</td><td>元の仕様に無いので新規定義。<code>#0070d1</code> を基調に、<code>warning</code> の赤は「予算超過」専用で中立カテゴリには使わない</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="lead">トークンは <code>src/theme/tokens.ts</code>（JSの生値用）と <code>tailwind.config.ts</code>（ユーティリティクラス用）に二重管理されている。<strong>片方だけ変えない。</strong></p>
+
+  <h3>8-3. 主なコンポーネント</h3>
+  <div class="grid">
+    <div class="card">
+      <h3>components/</h3>
+      <span class="path">frontend/src/components/</span>
+      <p>Badge / Band / Button / Container / FilterPill / Footer / Metric / <strong>Modal</strong> / MonthSelector / Nav / ProductCard / SectionTitle / TextInput</p>
+      <ul>
+        <li><code>Button</code> に <code>disabled</code> prop は無い。<code>variant="disabled"</code> で表す</li>
+        <li><code>Modal</code> は割り勘連携で追加した唯一のモーダル。<code>z-[60]</code> でスマホ下部タブバーの上に出す</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>charts/</h3>
+      <span class="path">frontend/src/charts/</span>
+      <p>ExpensePie / GroupBar / AssetTrendLine / SavingsBar と配色（categoryColors・chartTheme）。Recharts のラッパー。</p>
+    </div>
+    <div class="card">
+      <h3>api/</h3>
+      <span class="path">frontend/src/api/</span>
+      <p><code>client.ts</code> は素の <code>fetch</code> ラッパー2本（<code>getJson</code> / <code>mutateJson</code>）だけ。baseURL も認証ヘッダも持たない（同一ホスト・相対パス）。</p>
+      <ul>
+        <li>エラーは <code>{detail}</code> を取り出して <code>ApiError</code> に</li>
+        <li><code>types.ts</code> のキーは日本語（<code>年月</code>・<code>カテゴリ</code>・<code>金額</code>・<code>備考</code>・<code>日</code>・<code>割り勘ID</code>）</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>features/entry/</h3>
+      <span class="path">frontend/src/features/entry/</span>
+      <p>最も複雑なタブ。<code>EntryTab.tsx</code> にサブタブの挙動スイッチ（どのタブで日を出すか・並べ替えを出すか等）が定数として集約されている。</p>
+      <ul>
+        <li><code>entryParts.tsx</code> — DaySelect・並べ替え・合計</li>
+        <li><code>useFormAutoScroll.ts</code> — スマホでフォームを画面中央へ</li>
+        <li><code>WarikanDialog.tsx</code> — 割り勘反映のポップアップ</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="libs">
+  <h2>9. ライブラリとフレームワーク</h2>
+
+  <h3>ランタイム依存（本番のコードに入るもの）</h3>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>パッケージ</th><th>版</th><th>どこで</th><th>役割</th></tr></thead>
+      <tbody>
+        <tr><td><code>hono</code></td><td>^4.6.14</td><td>worker</td><td>Workers向けの軽量ルーター。ルーティング・ミドルウェア・エラーハンドリング</td></tr>
+        <tr><td><code>react</code> / <code>react-dom</code></td><td>^19.2.7</td><td>frontend</td><td>UI。状態管理ライブラリは入れていない（useState と小さな自作フックのみ）</td></tr>
+        <tr><td><code>recharts</code></td><td>^3.9.0</td><td>frontend</td><td>グラフ。バンドルが大きいのでグラフタブは動的 import で分割</td></tr>
+        <tr><td><code>@fontsource/inter</code> / <code>@fontsource/roboto</code></td><td>^5.3.0</td><td>frontend</td><td>フォントのセルフホスト（外部CDNに依存しない）</td></tr>
+        <tr><td><code>fastapi</code></td><td>—</td><td>backend</td><td>ローカル開発用API</td></tr>
+        <tr><td><code>pydantic</code></td><td>—</td><td>backend</td><td>リクエスト／レスポンスの検証</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>開発・テスト用の依存</h3>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>パッケージ</th><th>版</th><th>役割</th></tr></thead>
+      <tbody>
+        <tr><td><code>vite</code></td><td>^8.1.0</td><td>フロントのビルドと開発サーバー</td></tr>
+        <tr><td><code>@vitejs/plugin-react</code></td><td>^6.0.2</td><td>React の HMR と JSX 変換</td></tr>
+        <tr><td><code>tailwindcss</code> / <code>@tailwindcss/vite</code></td><td>^4.3.1</td><td>CSS。v4 はCSS-first設定で <code>global.css</code> の <code>@theme</code> が本体</td></tr>
+        <tr><td><code>vitest</code></td><td>^4.1.9（frontend） / ^2.1.8（worker）</td><td>テストランナー。frontend は jsdom 環境</td></tr>
+        <tr><td><code>@testing-library/react</code> / <code>jest-dom</code></td><td>^16.3.2 / ^6.9.1</td><td>コンポーネントテスト。実装詳細でなく画面の見え方で検証する</td></tr>
+        <tr><td><code>@vitest/coverage-v8</code></td><td>^4.1.9</td><td>カバレッジ</td></tr>
+        <tr><td><code>oxlint</code></td><td>^1.69.0</td><td>Rust製の高速リンター（ESLintの代わり）</td></tr>
+        <tr><td><code>typescript</code></td><td>~6.0.2 / ~5.7.2</td><td>型検査のみ。ビルドはしない</td></tr>
+        <tr><td><code>wrangler</code></td><td>^4.0.0</td><td>Workers のローカル実行・デプロイ・D1操作・シークレット管理</td></tr>
+        <tr><td><code>@cloudflare/workers-types</code></td><td>^5.x</td><td><code>D1Database</code> / <code>Fetcher</code> などの型</td></tr>
+        <tr><td><code>pytest</code> / <code>httpx</code> / <code>uvicorn</code></td><td>—</td><td>Python側のテストと開発サーバー</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note">
+    <strong>入れていないもの</strong>
+    状態管理（Redux・Zustand・TanStack Query）、ORM、UIコンポーネントライブラリ、日付ライブラリ。どれも「2人で使う家計簿」には重いと判断し、素の React と小さな自作ユーティリティで済ませている。日付処理は <code>dates.ts</code> / <code>utils/dates.ts</code> の自前実装。
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="tools">
+  <h2>10. ツール・実行環境・コマンド</h2>
+  <p class="lead"><strong>全体を一括で実行するトップレベルのコマンドは無い。</strong><code>backend/</code> <code>frontend/</code> <code>worker/</code> はそれぞれ独立してテストする。</p>
+
+  <h3>ローカル開発（FastAPI + Vite）</h3>
+<pre><code>cd backend &amp;&amp; python -m uvicorn main:app --port 8000
+cd frontend &amp;&amp; npm install &amp;&amp; npm run dev</code></pre>
+  <p>または <code>起動.bat</code> をダブルクリックで両方起動。この構成では割り勘連携は使えない（Worker専用のため <code>/api/warikan/status</code> が404になり、反映ボタンは出ない）。</p>
+
+  <h3>本番相当のスタック（Worker + ローカルD1）</h3>
+<pre><code>cd frontend &amp;&amp; npm run build
+cd worker   &amp;&amp; npm run dev</code></pre>
+  <p><code>wrangler dev</code> は :8787 で起動し、ローカルの miniflare D1 を使う（本番には影響しない）。</p>
+
+  <h3>デプロイ</h3>
+<pre><code>cd frontend &amp;&amp; npm run build
+cd worker   &amp;&amp; npm run deploy</code></pre>
+  <div class="warn">
+    <strong>必ず先にフロントをビルドする</strong>
+    Worker は <code>[assets]</code> で <code>frontend/dist</code> を <code>/api/*</code> と同じホストから配信する。ビルドを忘れると古い画面がデプロイされる。
+  </div>
+
+  <h3>テスト・型検査・lint</h3>
+<pre><code>cd backend  &amp;&amp; python -m pytest -q
+cd backend  &amp;&amp; python -m pytest tests/test_dates.py::test_name -q   # 単体
+
+cd frontend &amp;&amp; npm test            # vitest run
+cd frontend &amp;&amp; npm run test:watch
+cd frontend &amp;&amp; npx vitest run src/features/entry/EntryTab.test.tsx
+cd frontend &amp;&amp; npx tsc -b
+cd frontend &amp;&amp; npm run lint        # oxlint
+
+cd worker   &amp;&amp; npm test
+cd worker   &amp;&amp; npm run typecheck   # tsc --noEmit（src + tests）</code></pre>
+
+  <h3>D1 の確認</h3>
+<pre><code>npx wrangler d1 execute kakei-db --remote --command \
+  "SELECT month, COUNT(*), SUM(amount) FROM entries GROUP BY month ORDER BY month"
+
+npx wrangler d1 export kakei-db --remote --output backup.sql   # バックアップ</code></pre>
+</section>
+
+<!-- ============================================================ -->
+<section id="tests">
+  <h2>11. テスト</h2>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>対象</th><th>フレームワーク</th><th>ファイル数</th><th>方針</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>worker/</code></td><td>vitest</td><td>3</td>
+          <td><code>tests/testDb.ts</code> が <code>node:sqlite</code> のインメモリDBに <code>migrations/*.sql</code> を実際に適用する。HTTPは通さず repo 関数を直接呼ぶ</td>
+        </tr>
+        <tr>
+          <td><code>frontend/</code></td><td>vitest + Testing Library</td><td>27</td>
+          <td>jsdom。<code>vi.mock('../../api/client')</code> でAPIをモックし、呼び出し引数と画面表示の両方をアサートする</td>
+        </tr>
+        <tr>
+          <td><code>backend/</code></td><td>pytest</td><td>15</td>
+          <td>インメモリDBの <code>client</code> フィクスチャ経由でHTTPレベルの検証</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="lead"><code>worker/tests/repo.entries.test.ts</code> と <code>backend/tests/test_api_entries.py</code> は<strong>同じシナリオを意図的にミラーしている</strong>。片方を足したらもう片方も足す。</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="rules">
+  <h2>12. 設計上の制約と運用ルール</h2>
+
+  <h3>12-1. カテゴリ削除の保護</h3>
+  <p><code>DELETE /api/config/categories/{name}</code> は次の場合に400を返す。過去の集計を壊さないための保護で、<strong>両バックエンドでロジックを同期させる</strong>。</p>
+  <ul>
+    <li>実績データが1件以上ある</li>
+    <li>収入内訳の特別カテゴリ（夫給与・妻給与）である</li>
+    <li>バンドルラベル（サブスク・通信費）である</li>
+    <li>そもそも存在しない</li>
+  </ul>
+
+  <h3>12-2. CSV取込の制限</h3>
+  <p>アプリ内（設定タブ）の取込は<strong>少量の臨時追加専用</strong>。<code>source='import'</code> 固定で後から編集できず、<code>bundle_items</code> 非対応、新カテゴリも登録できない。</p>
+
+  <h3>12-3. 月次データ運用フロー（実データ）</h3>
+  <ol class="flow">
+    <li><span class="title">CSVを置く</span><p class="body"><code>backend/data/</code> に配置する。</p></li>
+    <li><span class="title">生データで検証</span><p class="body">年月・カテゴリ・金額を目視と機械の両方で確認。</p></li>
+    <li><span class="title">差分を提案</span><p class="body">「変更前 → 変更後 ＋ 理由」の形で出す。</p></li>
+    <li><span class="title">オーナーの承認を得る</span><p class="body">ここを飛ばさない。</p></li>
+    <li><span class="title">原本を保全してから反映</span><p class="body"><code>backend/backup/YYYY-MM-DD/</code> に原本を置いてからCSVを更新し、再検証。</p></li>
+    <li><span class="title">SQLに変換</span><p class="body"><code>backend/scripts/csv_to_sql.py</code> で INSERT 文を生成。</p></li>
+    <li><span class="title">本番に流す</span><p class="body"><code>npx wrangler d1 execute kakei-db --remote --file=&lt;生成したsql&gt;</code></p></li>
+    <li><span class="title">再クエリで突き合わせ</span><p class="body">件数と合計が期待値と一致することを確認する。</p></li>
+  </ol>
+
+  <h3>12-4. データのプライバシー</h3>
+  <p>実データ（家賃・投資額など）はリポジトリに入れない。<code>backend/data/</code>・<code>backend/backup/</code>・<code>*.db</code>・<code>.wrangler/</code>・<code>.dev.vars</code> はすべて gitignore 済み。リポジトリは公開されているため、コミット前に実額・メールアドレス・トークンが混ざっていないか確認する。</p>
+
+  <h3>12-5. 二重実装の同期</h3>
+  <div class="warn">
+    <strong>不具合修正や挙動変更は必ず両方に入れる</strong>
+    <code>worker/src/*.ts</code> だけ直すと、ローカルのFastAPIと挙動がずれて「ローカルでは直ったのに本番で再発」「その逆」が起きる。テストも両方に書く。唯一の例外は割り勘連携（Worker専用）。
+  </div>
+</section>
+
+<footer>
+  家計ダッシュボード3 — 仕様・設計・技術構成ドキュメント。
+  姉妹編: <a href="warikan-integration.html">割り勘アプリ連携の詳細</a>。
+  関連: ルートの <code>CLAUDE.md</code>（作業ガイド）、<code>DESIGN.md</code>（デザイン仕様）、<code>ROLLBACK_warikan.md</code>（連携の戻し方）。
+</footer>
+
+</div>
+</body>
+</html>

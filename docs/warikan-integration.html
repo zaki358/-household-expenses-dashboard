@@ -1,0 +1,734 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>割り勘アプリ連携の詳細</title>
+<link rel="stylesheet" href="docs.css">
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1>割り勘アプリ連携 — 仕組みと運用</h1>
+  <p>家計ダッシュボード3 に入力した支出を、ボタン1つで割り勘アプリ（<code>warikan</code>）にも記録する機能。同じ買い物を2つのアプリに手で入れ直す手間をなくすために作った。Cloudflare の Service Binding で Worker 同士を直接つなぐ。</p>
+  <div class="badges">
+    <span class="badge">Service Binding</span>
+    <span class="badge">共有トークン認証</span>
+    <span class="badge">冪等（external_ref）</span>
+    <span class="badge">キルスイッチ</span>
+    <span class="badge">一方向・手動トリガー</span>
+  </div>
+  <p class="subnav">
+    姉妹編: <a href="tech-stack.html">家計ダッシュボード3 の仕様・設計・技術構成</a>。
+    運用: ルートの <code>ROLLBACK_warikan.md</code>（戻し方の手順書）。
+  </p>
+  <nav class="toc">
+    <ol>
+      <li><a href="#ux">何ができるか</a></li>
+      <li><a href="#why">なぜ Service Binding なのか</a></li>
+      <li><a href="#flow">処理の流れ</a></li>
+      <li><a href="#auth">認証とキルスイッチ</a></li>
+      <li><a href="#kakei">家計簿側の実装</a></li>
+      <li><a href="#warikan">割り勘側の実装</a></li>
+      <li><a href="#mapping">データの対応</a></li>
+      <li><a href="#category">カテゴリの扱い</a></li>
+      <li><a href="#idempotency">二重反映の防止</a></li>
+      <li><a href="#guard">削除のガード</a></li>
+      <li><a href="#errors">エラー一覧</a></li>
+      <li><a href="#setup">セットアップ手順</a></li>
+      <li><a href="#rollback">止め方・戻し方</a></li>
+      <li><a href="#tests">テスト</a></li>
+      <li><a href="#limits">既知の制限</a></li>
+    </ol>
+  </nav>
+</header>
+
+<!-- ============================================================ -->
+<section id="ux">
+  <h2>1. 何ができるか</h2>
+  <p class="lead">家計簿の入力タブで、日付が入っているエントリの行に「反映」ボタンが出る。押すとポップアップが開き、支払った人を選んで「反映する」を押すと、割り勘アプリに支出が1件作られる。</p>
+
+  <ol class="flow">
+    <li>
+      <span class="title">家計簿にいつもどおり入力する</span>
+      <p class="body">例: 変動費タブで「食費 / 11月5日 / 3,500円 / 詳細: 食材」。</p>
+    </li>
+    <li>
+      <span class="title">その行の「反映」を押す</span>
+      <p class="body">ポップアップが開き、反映内容（日付・カテゴリ・金額・詳細）が確認用に表示される。</p>
+    </li>
+    <li>
+      <span class="title">支払った人を選ぶ</span>
+      <p class="body">候補は割り勘アプリの <code>users</code> から取ってくる。名前は家計簿側に持たないので、割り勘アプリで表示名を変えればここも自動で変わる。</p>
+    </li>
+    <li>
+      <span class="title">「反映する」を押す</span>
+      <p class="body">割り勘アプリの該当月に <code>2026-11-05 / 食材 / 3,500円 / 食費 / たくま</code> が1件できる。</p>
+    </li>
+    <li>
+      <span class="title">行の表示が「反映済み」に変わる</span>
+      <p class="body">同じ行をもう一度反映することはできない。隣の「取消」を押すと割り勘側の支出が消え、未反映に戻る。</p>
+    </li>
+  </ol>
+
+  <h3>反映ボタンが出る条件</h3>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>条件</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>連携が有効</td>
+          <td><code>GET /api/warikan/status</code> が <code>{"enabled": true}</code> を返すこと。Service Binding と共有トークンの両方が揃っている必要がある</td>
+        </tr>
+        <tr>
+          <td>対象のタブ</td>
+          <td><strong>変動費・車・バイク・投資</strong> のみ。割り勘は日付必須なので「日」を入力できるタブに限っている。家賃や給与、サブスクは対象外</td>
+        </tr>
+        <tr>
+          <td>日付が入っている</td>
+          <td>日が未入力の行はボタンがグレーで押せない（<code>title</code> に「日付を入力すると割り勘に反映できます」）</td>
+        </tr>
+        <tr>
+          <td>未反映である</td>
+          <td>反映済みの行は「反映済み」ラベルと「取消」ボタンに置き換わる</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="why">
+  <h2>2. なぜ Service Binding なのか</h2>
+  <p class="lead">割り勘アプリは <strong>Cloudflare Access</strong> で守られている。外部から <code>https://warikan.y-kakeibo.workers.dev/api/...</code> を叩いても、Worker に届く前にエッジで止められてログイン画面にリダイレクトされる。つまり「普通に fetch する」が使えない。</p>
+
+  <div class="legend">
+    <span class="who kakei">家計簿 Worker</span>
+    <span class="who access">Cloudflare Access</span>
+    <span class="who warikan">割り勘 Worker</span>
+  </div>
+
+<pre><code>【通常の経路】ブラウザ → Cloudflare Access（認証）→ 割り勘 Worker
+【今回の経路】家計簿 Worker ──[Service Binding]──→ 割り勘 Worker
+                                  ↑ Access を通らない</code></pre>
+
+  <h3>検討した3案</h3>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>方式</th><th>内容</th><th>採否</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Service Binding</strong></td>
+          <td>家計簿 Worker から割り勘 Worker を直接呼ぶ。エッジを通らないので Access の設定変更が要らない。代わりに共有トークンで認証する</td>
+          <td><span class="flag on">採用</span></td>
+        </tr>
+        <tr>
+          <td>Access サービストークン</td>
+          <td>公開URL経由で呼ぶ。Cloudflare ダッシュボードでサービストークンを発行し、Access のポリシーに Service Auth を追加する作業が必要。割り勘側の認証ミドルウェアもサービストークン対応に改修が要る</td>
+          <td><span class="flag off">不採用</span></td>
+        </tr>
+        <tr>
+          <td>割り勘の D1 を直接書く</td>
+          <td>家計簿 Worker に <code>warikan-db</code> のバインディングを追加して直接 INSERT。割り勘側は一切触らずに済む</td>
+          <td><span class="flag off">不採用</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note">
+    <strong>D1 直書きを避けた理由</strong>
+    割り勘アプリ側には「期間（<code>monthly_periods</code>）が無ければ作る」「確定済みの月を更新したら <code>is_dirty</code> を立てる」「カテゴリの実在チェック」といった業務ロジックがある。直書きするとこれらを家計簿側で再実装することになり、割り勘側のスキーマが変わるたびに静かに壊れる。<strong>APIを通すことで、割り勘のルールは割り勘が持ったままにできる。</strong>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="flow">
+  <h2>3. 処理の流れ</h2>
+  <div class="legend">
+    <span class="who browser">ブラウザ</span>
+    <span class="who kakei">家計簿 Worker</span>
+    <span class="who warikan">割り勘 Worker</span>
+    <span class="who db">D1</span>
+  </div>
+
+  <ol class="flow">
+    <li>
+      <span class="title"><span class="who browser">ブラウザ</span> 入力タブを開く</span>
+      <p class="body"><code>EntryTab</code> がマウント時に <code>getConfig()</code> と並行して <code>getWarikanStatus()</code> を呼ぶ。失敗（404・連携なし）は<strong>エラーにせず「連携無効」として扱う</strong>ので、ローカルの FastAPI でも画面は壊れない。</p>
+    </li>
+    <li>
+      <span class="title"><span class="who browser">ブラウザ</span> 「反映」クリック → 支払者を取得</span>
+      <p class="body"><code>WarikanDialog</code> が開き、<code>GET /api/warikan/users</code> を1回呼ぶ。候補が1人だけなら自動で選択し、「相手が割り勘アプリを一度も開いていない場合は候補に出ません」と添える。</p>
+    </li>
+    <li>
+      <span class="title"><span class="who kakei">家計簿 Worker</span> Service Binding で中継</span>
+      <p class="body"><code>env.WARIKAN.fetch()</code> で <code>https://warikan.internal/api/internal/users</code> を呼ぶ。ホスト名はバインディングでは無視されるのでダミーでよい。</p>
+<pre><code>// worker/src/warikan.ts
+service.fetch(new Request(`${BASE}${path}`, {
+  ...init,
+  headers: { ...init.headers, 'X-Internal-Token': token },
+}))</code></pre>
+    </li>
+    <li>
+      <span class="title"><span class="who browser">ブラウザ</span> 支払者を選んで「反映する」</span>
+      <p class="body"><code>POST /api/entries/{id}/warikan</code> に <code>{"paid_by": "&lt;userId&gt;"}</code> を送る。</p>
+    </li>
+    <li>
+      <span class="title"><span class="who kakei">家計簿 Worker</span> 事前チェック</span>
+      <p class="body">エントリを引き、(1) 存在するか → 404、(2) 既に反映済みでないか → 409、を見る。そのあと <code>buildExpensePayload()</code> が日付の有無・金額の上限・支払者の空を検証する（純関数なのでテストしやすい）。</p>
+    </li>
+    <li>
+      <span class="title"><span class="who kakei">家計簿 Worker</span> → <span class="who warikan">割り勘 Worker</span> 支出を作る</span>
+      <p class="body"><code>POST /api/internal/expenses</code>。</p>
+<pre><code>{
+  "externalRef": "kakei:entry:123",
+  "ym":          "2026-11",
+  "spentOn":     "2026-11-05",
+  "paidBy":      "31fbc62a-...",
+  "amount":      3500,
+  "itemName":    "食材",
+  "categoryName":"食費"
+}</code></pre>
+    </li>
+    <li>
+      <span class="title"><span class="who warikan">割り勘 Worker</span> 検証して書き込む</span>
+      <p class="body">トークン検証 → zod → 年月と日付の整合 → <strong>由来キーで既存チェック</strong> → 支払者の実在 → カテゴリを名前で upsert → 期間を取得または作成 → INSERT。INSERT は「支出の追加」と「確定済み期間なら <code>is_dirty=1</code>」を <code>D1.batch</code> で原子的に実行する。</p>
+    </li>
+    <li>
+      <span class="title"><span class="who kakei">家計簿 Worker</span> → <span class="who db">D1</span> 反映先IDを保存</span>
+      <p class="body">返ってきた支出IDを <code>entries.warikan_expense_id</code> に書く。これで画面が「反映済み」になり、取消もできるようになる。</p>
+    </li>
+    <li>
+      <span class="title"><span class="who browser">ブラウザ</span> 一覧を取り直す</span>
+      <p class="body">反映APIのレスポンスは<strong>全グループ・全月の一覧</strong>なので、そのまま画面に出すと変動費タブに家賃が混ざる。既存の追加・編集と同じく、絞り込み条件つきで <code>getEntries(month, group)</code> を呼び直す。</p>
+    </li>
+  </ol>
+</section>
+
+<!-- ============================================================ -->
+<section id="auth">
+  <h2>4. 認証とキルスイッチ</h2>
+  <p class="lead">Service Binding は Cloudflare のエッジを通らないため、割り勘 Worker には Access の JWT が届かない。代わりに<strong>共有トークン</strong>で認証する。</p>
+
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>どこ</th><th>名前</th><th>登録方法</th></tr></thead>
+      <tbody>
+        <tr><td>割り勘 Worker</td><td><code>INTERNAL_API_TOKEN</code></td><td><code>wrangler secret put</code>（ローカルは <code>apps/api/.dev.vars</code>）</td></tr>
+        <tr><td>家計簿 Worker</td><td><code>WARIKAN_INTERNAL_TOKEN</code></td><td><code>wrangler secret put</code>（ローカルは <code>worker/.dev.vars</code>）</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="lead">値は<strong>同じであることだけが条件</strong>で、人間が覚えておく必要はない。やり直したいときは新しい値を両方に入れ直せばよい。</p>
+
+  <h3>4-1. 検証の実装</h3>
+  <p><code>apps/api/src/middleware/internalAuth.ts</code>。<code>X-Internal-Token</code> ヘッダを定数時間で比較する。早期 return で異なる位置が分かるとトークンを1文字ずつ推測できてしまうため、長さが同じ場合は必ず全文字を走査する。</p>
+<pre><code>function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i &lt; a.length; i += 1) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}</code></pre>
+
+  <h3>4-2. 二重の守り</h3>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>経路</th><th>何が守るか</th></tr></thead>
+      <tbody>
+        <tr><td>インターネットから <code>/api/internal/*</code></td><td><strong>Cloudflare Access</strong> が Worker に届く前に遮断（302でログイン画面へ）</td></tr>
+        <tr><td>Service Binding から</td><td><strong>共有トークン</strong>。Access は通らないのでここが唯一の関門</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="lead">内部APIのパスを <code>/api/</code> 配下にしているのは、<code>wrangler.jsonc</code> の <code>run_worker_first</code> が <code>["/api/*"]</code> のため。<code>/internal/*</code> などにすると静的アセットの SPA フォールバックに食われて Worker に届かない。</p>
+
+  <h3>4-3. キルスイッチ</h3>
+  <div class="note">
+    <strong>トークンかバインディングのどちらかを外せば、連携前の挙動に完全に戻る</strong>
+    家計簿側は <code>isWarikanEnabled()</code> が <code>Boolean(service &amp;&amp; token)</code> なので、どちらかが無ければ <code>GET /api/warikan/status</code> が <code>false</code> を返し、画面から「反映 / 反映済み / 取消」が消える。割り勘側も <code>INTERNAL_API_TOKEN</code> 未設定なら内部APIを全て403で閉じる（fail-closed）。
+  </div>
+  <p>反映済みの行の「削除」をブロックするガードも、連携が無効な間は<strong>外れる</strong>。連携を切った後に家計簿のエントリが消せなくなる、という詰みを避けるため。</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="kakei">
+  <h2>5. 家計簿側の実装</h2>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>ファイル</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>worker/wrangler.toml</code></td>
+          <td>Service Binding の宣言。<code>[[services]] binding = "WARIKAN" / service = "warikan"</code>。トークンは <code>[vars]</code> に書かずシークレットで渡す</td>
+        </tr>
+        <tr>
+          <td><code>worker/src/warikan.ts</code><br><span class="path">181行</span></td>
+          <td>連携クライアント。HTTPの都合だけを持ち、ルーティングとは分離している。<code>WarikanService</code> は <code>Fetcher</code> 互換の最小インターフェースなので、テストではフェイクを差し込める</td>
+        </tr>
+        <tr>
+          <td><code>worker/src/errors.ts</code></td>
+          <td><code>HttpError</code>。もともと <code>index.ts</code> にあったものを、<code>warikan.ts</code> から投げられるよう切り出した（循環 import を避けるため）</td>
+        </tr>
+        <tr>
+          <td><code>worker/src/repo.ts</code></td>
+          <td><code>EntryRow</code> に <code>割り勘ID</code> を追加。<code>listEntries</code> の SELECT に列を足し、<code>findEntryById</code>（1件取得）と <code>setWarikanExpenseId</code>（反映先IDの保存・クリア）を新設</td>
+        </tr>
+        <tr>
+          <td><code>worker/src/index.ts</code></td>
+          <td>ルート4本の追加と、既存 <code>DELETE /api/entries/{id}</code> へのガード追加</td>
+        </tr>
+        <tr>
+          <td><code>worker/migrations/0005_add_entry_warikan_id.sql</code></td>
+          <td><code>ALTER TABLE entries ADD COLUMN warikan_expense_id TEXT</code>。<code>backend/migrations/</code> にも同じものを置く</td>
+        </tr>
+        <tr>
+          <td><code>frontend/src/components/Modal.tsx</code></td>
+          <td>このアプリ初のモーダル。<code>createPortal</code> で body 直下へ。<code>z-[60]</code> なのはスマホ下部タブバーが <code>z-50</code> のため。Escape と背景クリックで閉じ、開いている間は背面スクロールを止める</td>
+        </tr>
+        <tr>
+          <td><code>frontend/src/features/entry/WarikanDialog.tsx</code></td>
+          <td>反映ポップアップ。支払者の取得・選択・送信とエラー表示</td>
+        </tr>
+        <tr>
+          <td><code>frontend/src/features/entry/EntryTab.tsx</code></td>
+          <td><code>WARIKAN_TABS</code> 定数、<code>showWarikan</code> prop、行の3状態（反映／反映済み+取消／無効）の描画、取消ハンドラ</td>
+        </tr>
+        <tr>
+          <td><code>frontend/src/api/client.ts</code> / <code>types.ts</code></td>
+          <td><code>getWarikanStatus</code> / <code>getWarikanUsers</code> / <code>reflectToWarikan</code> / <code>cancelWarikanReflect</code> と、<code>IndexedEntry.割り勘ID</code>・<code>WarikanUser</code>・<code>WarikanStatus</code></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>追加したルート</h3>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>メソッド</th><th>パス</th><th>挙動</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><span class="method get">GET</span></td><td><code>/api/warikan/status</code></td>
+          <td><code>{"enabled": boolean}</code>。フロントはこれを見て反映UIを出すか決める</td>
+        </tr>
+        <tr>
+          <td><span class="method get">GET</span></td><td><code>/api/warikan/users</code></td>
+          <td><code>[{"user_id": "...", "display_name": "..."}]</code>。割り勘側の camelCase を家計簿の snake_case に変換している</td>
+        </tr>
+        <tr>
+          <td><span class="method post">POST</span></td><td><code>/api/entries/{id}/warikan</code></td>
+          <td>body は <code>{"paid_by": "&lt;userId&gt;"}</code>。成功すると更新後のエントリ一覧を返す</td>
+        </tr>
+        <tr>
+          <td><span class="method delete">DELETE</span></td><td><code>/api/entries/{id}/warikan</code></td>
+          <td>反映の取り消し。割り勘側が404（既に手で消されていた）でも成功扱いにして、家計簿側の記録だけクリアし整合を取る</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="warikan">
+  <h2>6. 割り勘側の実装</h2>
+  <p class="lead">リポジトリは <code>C:\Users\barub\Project\warikan</code>、ブランチは <code>feature/kakei-integration</code>。</p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>ファイル</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>apps/api/migrations/0003_external_ref.sql</code></td>
+          <td><code>monthly_expenses.external_ref</code> の追加と UNIQUE インデックス。SQLite の UNIQUE は NULL を重複扱いしないので、割り勘アプリ内で手入力した支出（NULL）は何件でも共存できる</td>
+        </tr>
+        <tr>
+          <td><code>apps/api/src/middleware/internalAuth.ts</code></td>
+          <td>共有トークンの検証。<code>accessAuth</code> と違い <code>c.var.user</code> は立てない（呼び出し元が支払者を明示するため）</td>
+        </tr>
+        <tr>
+          <td><code>apps/api/src/routes/internal.ts</code></td>
+          <td>内部API 3本。画面向けAPI（<code>/api/monthly</code> 等）とは分けてあり、<strong>こちら側だけが</strong>「カテゴリ名での自動作成」と「由来キーによる冪等性」を持つ</td>
+        </tr>
+        <tr>
+          <td><code>apps/api/src/index.ts</code></td>
+          <td><code>app.use("/api/*", accessAuth())</code> <strong>より前</strong>に <code>app.route("/api/internal", internalRoutes)</code> を登録</td>
+        </tr>
+        <tr>
+          <td><code>apps/api/src/db/categories.ts</code></td>
+          <td><code>upsertCategoryByName()</code> を追加</td>
+        </tr>
+        <tr>
+          <td><code>apps/api/src/db/monthly.ts</code></td>
+          <td><code>ExpenseInput.externalRef</code>、<code>insertExpense</code> の列追加、<code>findExpenseByExternalRef()</code></td>
+        </tr>
+        <tr>
+          <td><code>apps/api/src/lib/ym.ts</code></td>
+          <td><code>spentOnInPeriod()</code> を <code>routes/monthly.ts</code> から移動（内部APIと共用するため）</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>内部API</h3>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>メソッド</th><th>パス</th><th>挙動</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><span class="method get">GET</span></td><td><code>/api/internal/users</code></td>
+          <td><code>{ok:true, data:[{userId, displayName}]}</code></td>
+        </tr>
+        <tr>
+          <td><span class="method post">POST</span></td><td><code>/api/internal/expenses</code></td>
+          <td>新規なら <strong>201</strong> + <code>created:true</code>、既に同じ <code>externalRef</code> があれば <strong>200</strong> + <code>created:false</code> で既存行を返す</td>
+        </tr>
+        <tr>
+          <td><span class="method delete">DELETE</span></td><td><code>/api/internal/expenses/{id}</code></td>
+          <td>外部由来の支出だけ削除できる。<code>external_ref</code> が NULL の行（＝割り勘アプリ内で手入力したもの）は403で拒否する安全弁</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>リクエストのスキーマ（zod）</h3>
+<pre><code>z.object({
+  externalRef:  z.string().trim().min(1).max(100),
+  ym:           z.string().regex(/^\d{4}-\d{2}$/),
+  spentOn:      z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  paidBy:       z.string().min(1),
+  amount:       z.number().int().min(1).max(10_000_000),
+  itemName:     z.string().trim().min(1).max(60),
+  categoryName: z.string().trim().min(1).max(20).nullable().optional(),
+})</code></pre>
+</section>
+
+<!-- ============================================================ -->
+<section id="mapping">
+  <h2>7. データの対応</h2>
+  <p class="lead">家計簿と割り勘ではデータの形が違う。特に<strong>割り勘には「詳細/メモ」欄が無い</strong>（自由記述は品目名60文字だけ）のが効いてくる。</p>
+
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>家計簿 <code>entries</code></th><th>→</th><th>割り勘 <code>monthly_expenses</code></th><th>変換のルール</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>年月</code> + <code>日</code></td><td>→</td><td><code>spent_on</code></td>
+          <td><code>`${年月}-${String(日).padStart(2,'0')}`</code>。日が <code>null</code> なら反映不可</td>
+        </tr>
+        <tr>
+          <td><code>金額</code></td><td>→</td><td><code>amount</code></td>
+          <td>そのまま。上限 10,000,000 を超えるものは家計簿側で先に弾く</td>
+        </tr>
+        <tr>
+          <td><code>備考</code>（詳細）</td><td>→</td><td><code>item_name</code></td>
+          <td><strong>詳細が空ならカテゴリ名で代替</strong>。60文字で切り詰める</td>
+        </tr>
+        <tr>
+          <td><code>カテゴリ</code></td><td>→</td><td><code>category_id</code></td>
+          <td>IDではなく<strong>名前</strong>を渡し、割り勘側が名前で引く／無ければ作る</td>
+        </tr>
+        <tr>
+          <td>（画面で選ぶ）</td><td>→</td><td><code>paid_by</code></td>
+          <td>割り勘の <code>users.id</code>（UUID）。家計簿には人の概念が無いので毎回選ぶ</td>
+        </tr>
+        <tr>
+          <td><code>id</code></td><td>→</td><td><code>external_ref</code></td>
+          <td><code>kakei:entry:&lt;id&gt;</code> の形。二重反映の判定キー</td>
+        </tr>
+        <tr>
+          <td><code>warikan_expense_id</code></td><td>←</td><td><code>id</code></td>
+          <td>割り勘が発行したUUIDを家計簿が保持する（逆方向）</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>変換を行う純関数</h3>
+<pre><code>// worker/src/warikan.ts
+export function buildExpensePayload(entry: EntryRow, paidBy: string): WarikanExpensePayload {
+  if (entry.日 === null) throw new ValidationError('日付が未入力のため割り勘に反映できません')
+  if (entry.金額 &gt; WARIKAN_MAX_AMOUNT) throw new ValidationError('...')
+  const payer = paidBy.trim()
+  if (!payer) throw new ValidationError('支払った人を選択してください')
+
+  return {
+    externalRef:  `kakei:entry:${entry.id}`,
+    ym:           entry.年月,
+    spentOn:      `${entry.年月}-${String(entry.日).padStart(2, '0')}`,
+    paidBy:       payer,
+    amount:       entry.金額,
+    itemName:     (entry.備考.trim() || entry.カテゴリ).slice(0, WARIKAN_MAX_ITEM_NAME),
+    categoryName: entry.カテゴリ,
+  }
+}</code></pre>
+  <p class="lead">検証をこの純関数に集めているので、ルート側は「404か409か」だけを見ればよく、変換と検証はテストで直接叩ける。</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="category">
+  <h2>8. カテゴリの扱い</h2>
+  <p class="lead">2つのアプリでカテゴリ名が揃っていなかった。<strong>一致するのは「食費」だけ</strong>だった。</p>
+
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>家計簿（変動費）</th><th>割り勘の seed（7個）</th></tr></thead>
+      <tbody>
+        <tr><td>食費</td><td>食費 ✅</td></tr>
+        <tr><td>消耗品</td><td>日用品</td></tr>
+        <tr><td>交際費</td><td>外食</td></tr>
+        <tr><td>娯楽費</td><td>娯楽</td></tr>
+        <tr><td>服 / 美容院</td><td>（対応なし）</td></tr>
+        <tr><td>ガソリン(車) / ガソリン(バイク)</td><td>交通費</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>採った方針 — 家計簿を正本にして、使った名前をその場で生やす</h3>
+  <p>対応表をコードに持つ案もあったが、家計簿にカテゴリを追加するたびに表を書き足す必要があり、忘れると静かに「未分類」になる。そこで<strong>割り勘の内部APIはカテゴリIDではなく名前を受け取り、無ければ作る</strong>ことにした。</p>
+<pre><code>INSERT INTO categories (name, sort_order, is_active)
+VALUES (?, 900, 1)
+ON CONFLICT (name) DO UPDATE SET is_active = 1</code></pre>
+  <ul>
+    <li><code>categories.name</code> が UNIQUE なので競合しても1行に収まる</li>
+    <li><code>sort_order = 900</code> で seed の7個（10〜99）より<strong>後ろ</strong>に並べ、割り勘の手入力フォームのドロップダウンの先頭を荒らさない</li>
+    <li>既存行が <code>is_active = 0</code> だった場合は 1 に戻す。家計簿で実際に使われているカテゴリが非表示のままだと、一覧でカテゴリ名が出なくなるため</li>
+  </ul>
+
+  <div class="note">
+    <strong>定期同期（cron）にしなかった理由</strong>
+    家計簿の30カテゴリのうち割り勘で意味があるのは一部で、家賃やNISAをドロップダウンに出しても邪魔なだけ。定期実行には逆方向のバインディングと cron が要る。「使ったときに生やす」なら、実際に反映したカテゴリだけが自然に増える。<br>
+    なお家計簿には<strong>カテゴリのリネーム機能が無く</strong>（追加と削除だけ）、削除も実績データがあると400で拒否されるため、「反映済みのカテゴリが家計簿から消える／名前が変わる」はほぼ起きない。
+  </div>
+
+  <p>割り勘の既存7カテゴリは<strong>そのまま残している</strong>（過去データに触らない方針）。結果として、割り勘のドロップダウンには「日用品」と「消耗品」が並ぶ。気になれば後から統合できる。</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="idempotency">
+  <h2>9. 二重反映の防止</h2>
+  <p class="lead">割り勘アプリにはもともと冪等性の仕組みが無く、同じJSONを2回送れば支出が2件できた。<strong>2段構え</strong>で防いでいる。</p>
+
+  <div class="grid">
+    <div class="card api">
+      <h3>① 家計簿側 — 反映先IDを持つ</h3>
+      <span class="path">entries.warikan_expense_id</span>
+      <p>反映に成功したら割り勘が返した支出IDを保存する。</p>
+      <ul>
+        <li>画面に「反映済み」と出せる</li>
+        <li>ボタンを押せなくできる</li>
+        <li>「取消」で割り勘側の支出を特定して消せる</li>
+        <li>APIでも <code>409</code> で弾く</li>
+      </ul>
+    </div>
+    <div class="card web">
+      <h3>② 割り勘側 — 由来キーに UNIQUE</h3>
+      <span class="path">monthly_expenses.external_ref</span>
+      <p>同じ <code>kakei:entry:123</code> で2回目が来たら、新規作成せず<strong>既存の行をそのまま返す</strong>（<code>created:false</code>）。</p>
+      <ul>
+        <li>①が通信断で保存に失敗した場合の最後の砦</li>
+        <li>同時実行で UNIQUE 違反になった場合も catch して既存行を返す</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="note">
+    <strong>なぜ両方いるのか</strong>
+    ①だけだと穴が残る。「割り勘側への登録は成功したが、家計簿側にIDを保存する直前に通信が切れた／タブを閉じた」とき、家計簿は未反映のままなのでもう一度押せてしまい、割り勘側に2件できる。②があればその2回目もDBが1件にまとめる。
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="guard">
+  <h2>10. 削除のガード</h2>
+  <p>反映済みのエントリは、家計簿側の <code>DELETE /api/entries/{id}</code> が <strong>409「先に割り勘への反映を取り消してください」</strong> で拒否する。画面でも「削除」ボタンが無効になる。</p>
+  <p class="lead">家計簿側だけ消すと、割り勘に由来不明の支出が残り、しかも取り消す手段（反映先IDの記録）も同時に失われるため。取り消しは1クリックなので運用コストは小さいと判断した。</p>
+  <div class="note">
+    <strong>連携を切ったら外れる</strong>
+    このガードは <code>isWarikanEnabled()</code> が true のときだけ効く。連携を止めた後に <code>warikan_expense_id</code> が残った行が消せなくなる、という詰みを避けている。
+  </div>
+  <p>逆方向の安全弁として、割り勘側の <code>DELETE /api/internal/expenses/{id}</code> は <code>external_ref</code> が NULL の支出（＝割り勘アプリ内で手入力したもの）を403で拒否する。家計簿からの操作で割り勘の手入力データが消えることはない。</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="errors">
+  <h2>11. エラー一覧</h2>
+  <p class="lead">割り勘側のエンベロープ <code>{ok,data,error}</code> は家計簿側で剥がされ、家計簿の <code>{"detail": "..."}</code> 形式に変換される。</p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>状況</th><th>家計簿が返すもの</th><th>画面での見え方</th></tr></thead>
+      <tbody>
+        <tr><td>エントリが無い</td><td><code>404 エントリが存在しません</code></td><td>ダイアログ内にエラー表示</td></tr>
+        <tr><td>既に反映済み</td><td><code>409 既に割り勘へ反映済みです</code></td><td>通常は起きない（ボタンが出ない）</td></tr>
+        <tr><td>日付が未入力</td><td><code>400 日付が未入力のため割り勘に反映できません</code></td><td>通常は起きない（ボタンが無効）</td></tr>
+        <tr><td>金額が上限超過</td><td><code>400 割り勘に反映できる金額は10,000,000円までです</code></td><td>ダイアログ内にエラー表示</td></tr>
+        <tr><td>支払者が未選択</td><td><code>400 支払った人を選択してください</code></td><td>通常は起きない（ボタンが無効）</td></tr>
+        <tr><td>割り勘側が400（支払者・カテゴリ・日付）</td><td><code>400 割り勘アプリ: &lt;元のメッセージ&gt;</code></td><td>原因がそのまま読める</td></tr>
+        <tr><td>割り勘側が403（トークン不一致・内部API無効）</td><td><code>503 割り勘アプリとの連携が許可されていません</code></td><td>設定の問題として扱う</td></tr>
+        <tr><td>連携が未設定</td><td><code>503 割り勘アプリとの連携が設定されていません</code></td><td>通常は起きない（UIが出ない）</td></tr>
+        <tr><td>割り勘Workerに到達できない</td><td><code>502 割り勘アプリに接続できませんでした</code></td><td>ローカルで割り勘を起動し忘れたとき等</td></tr>
+        <tr><td>その他</td><td><code>502 割り勘アプリとの通信に失敗しました</code></td><td>—</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="setup">
+  <h2>12. セットアップ手順</h2>
+
+  <h3>12-1. ローカル開発</h3>
+  <p>Service Binding は wrangler の dev registry 経由で解決されるので、<strong>両方の <code>wrangler dev</code> を同時に起動しておく</strong>必要がある（ポートが衝突しないようどちらかをずらす）。</p>
+<pre><code># 1. 両方の .dev.vars に同じトークンを書く
+#    warikan: apps/api/.dev.vars   INTERNAL_API_TOKEN=local-dev-internal-token
+#    kakei:   worker/.dev.vars     WARIKAN_INTERNAL_TOKEN=local-dev-internal-token
+
+# 2. ローカルD1にマイグレーションを当てる
+cd C:/Users/barub/Project/warikan/apps/api
+npx wrangler d1 migrations apply warikan-db --local
+cd C:/Users/barub/company/kakei-dashboard-3/worker
+npx wrangler d1 migrations apply kakei-db --local
+
+# 3. 割り勘を起動（別ターミナル）
+cd C:/Users/barub/Project/warikan/apps/api &amp;&amp; npx wrangler dev --port 8788
+
+# 4. 家計簿を起動（別ターミナル）
+cd C:/Users/barub/company/kakei-dashboard-3/frontend &amp;&amp; npm run build
+cd ../worker &amp;&amp; npx wrangler dev --port 8787</code></pre>
+  <p>割り勘側の <code>.dev.vars</code> に <code>DEV_BYPASS_EMAIL</code> を入れておくと自分の <code>users</code> 行が作られる。相手役は <code>npx wrangler d1 execute warikan-db --local --command "INSERT INTO users ..."</code> で用意する。</p>
+  <p>確認は <code>curl http://127.0.0.1:8787/api/warikan/status</code> が <code>{"enabled":true}</code> を返すか、<code>/api/warikan/users</code> が割り勘のユーザーを返すか。後者が通れば Service Binding とトークンの往復ができている。</p>
+
+  <h3>12-2. 本番へのデプロイ</h3>
+  <ol class="flow">
+    <li>
+      <span class="title">本番D1をバックアップする</span>
+<pre><code>npx wrangler d1 export kakei-db   --remote --output kakei-before.sql
+npx wrangler d1 export warikan-db --remote --output warikan-before.sql</code></pre>
+      <p class="body">出力は gitignore 済みの場所（<code>backend/backup/</code> など）へ。</p>
+    </li>
+    <li>
+      <span class="title">共有シークレットを登録する</span>
+      <p class="body">同じ値を両方に。値は人間が覚えなくてよい。</p>
+<pre><code>cd .../warikan/apps/api &amp;&amp; npx wrangler secret put INTERNAL_API_TOKEN
+cd .../kakei-dashboard-3/worker &amp;&amp; npx wrangler secret put WARIKAN_INTERNAL_TOKEN</code></pre>
+    </li>
+    <li>
+      <span class="title">マイグレーションを適用する</span>
+<pre><code>npx wrangler d1 migrations apply warikan-db --remote   # 0003_external_ref
+npx wrangler d1 migrations apply kakei-db   --remote   # 0005_add_entry_warikan_id</code></pre>
+      <p class="body">どちらも列の追加だけなので既存データは変わらない。</p>
+    </li>
+    <li>
+      <span class="title">割り勘を先にデプロイする</span>
+      <p class="body">内部APIが無いと家計簿から呼べない。<code>npm run build -w @warikan/web</code> してから <code>npx wrangler deploy</code>。</p>
+    </li>
+    <li>
+      <span class="title">家計簿をデプロイする</span>
+<pre><code>cd frontend &amp;&amp; npm run build
+cd ../worker &amp;&amp; npx wrangler deploy</code></pre>
+      <p class="body">デプロイ出力の bindings に <code>env.WARIKAN (warikan)</code> が出ていることを確認する。</p>
+    </li>
+    <li>
+      <span class="title">動作確認</span>
+      <p class="body">本番は Cloudflare Access の内側なのでブラウザで確認する。入力タブの変動費に「反映」が出ていれば <code>status</code> が true。少額の1件で「反映 → 割り勘アプリで確認 → 取消」まで通しておくと安心。</p>
+    </li>
+  </ol>
+
+  <div class="warn">
+    <strong>シークレットを入れるまで連携はOFF</strong>
+    デプロイしただけでは <code>status</code> が false のままで、画面は連携前とまったく同じ。「デプロイしてから落ち着いて有効化する」ことができる。
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="rollback">
+  <h2>13. 止め方・戻し方</h2>
+  <p class="lead">詳細はルートの <code>ROLLBACK_warikan.md</code> にある。段階1だけで画面も挙動も連携前に戻る。</p>
+
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>段階</th><th>やること</th><th>データへの影響</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>1</strong></td>
+          <td><code>npx wrangler secret delete WARIKAN_INTERNAL_TOKEN</code> → 再デプロイ</td>
+          <td>なし。反映UIが消えて連携前の画面に戻る</td>
+        </tr>
+        <tr>
+          <td><strong>2</strong></td>
+          <td><code>DELETE FROM monthly_expenses WHERE external_ref LIKE 'kakei:%'</code><br><code>UPDATE entries SET warikan_expense_id = NULL</code></td>
+          <td>家計簿由来の支出だけ消える。割り勘で手入力した分は <code>external_ref</code> が NULL なので無傷</td>
+        </tr>
+        <tr>
+          <td><strong>3</strong></td>
+          <td>コードを戻す（割り勘は <code>git switch master</code>、家計簿は <code>backend/backup/2026-11-04_warikan連携前/</code> の <code>.orig</code>）</td>
+          <td>—</td>
+        </tr>
+        <tr>
+          <td><strong>4</strong></td>
+          <td>DB列を消す（通常不要）</td>
+          <td>追加しただけの列なので残しても無害</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note">
+    <strong>段階2の精算やり直し</strong>
+    確定済み（settled）の月から支出を消した場合、割り勘アプリの精算結果は古いままになる。割り勘アプリで「計算する」をやり直すこと。
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="tests">
+  <h2>14. テスト</h2>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>場所</th><th>件数</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>warikan/apps/api/test/internal.test.ts</code></td><td>18</td>
+          <td>トークン無し／不一致／未設定で403、支出作成、<strong>同じ externalRef で2回送っても1件</strong>、カテゴリ自動作成、対象月外・存在しない支払者で400、外部由来のみ削除可、確定済み期間で <code>is_dirty</code> が立つ</td>
+        </tr>
+        <tr>
+          <td><code>worker/tests/warikan.test.ts</code></td><td>24</td>
+          <td><code>buildExpensePayload</code> の純関数テスト（備考が空ならカテゴリ名／60字切り詰め／日のゼロ埋め／上限）と、フェイク Fetcher を使った <code>createExpense</code> / <code>deleteExpense</code>（エンベロープ剥がし、403→503、500→502、到達不能→502）</td>
+        </tr>
+        <tr>
+          <td><code>worker/tests/repo.entries.test.ts</code></td><td>+6</td>
+          <td>追加直後は <code>割り勘ID</code> が null、<code>findEntryById</code> の往復、反映状態が金額更新で消えないこと</td>
+        </tr>
+        <tr>
+          <td><code>frontend/.../EntryTab.test.tsx</code></td><td>+10</td>
+          <td>連携無効なら反映ボタンが出ない、日付なしは無効、固定費タブには出ない、支払者を選んで送信、失敗時のエラー表示、反映済みの行は削除が無効、取消で元に戻る、<strong>反映後に絞り込み条件つきで取り直す</strong></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="lead">テストで Service Binding を差し替えられるよう、<code>warikan.ts</code> は <code>Fetcher</code> そのものではなく <code>{ fetch(request): Promise&lt;Response&gt; }</code> という最小インターフェースを受け取る設計にしている。</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="limits">
+  <h2>15. 既知の制限</h2>
+  <ul>
+    <li><strong>反映後に家計簿側で金額やカテゴリを編集しても割り勘には伝わらない。</strong>直すなら「取消 → 反映」の2クリック。双方向同期は作っていない</li>
+    <li>割り勘アプリ側で手入力した支出は家計簿に入ってこない（<strong>一方向</strong>）</li>
+    <li>サブスク・通信費（<code>bundle_items</code>）は日付を持たないので対象外</li>
+    <li>割り勘アプリで<strong>相手が一度もログインしていないと <code>users</code> に行が無く</strong>、支払者として選べない（割り勘アプリ側の既知の制約）</li>
+    <li>カテゴリは「使ったときに生える」ので、家計簿でカテゴリ名を変えても割り勘の既存カテゴリ名は変わらない（家計簿にリネーム機能が無いため実際には起きにくい）</li>
+    <li>ローカルの FastAPI（<code>backend/</code>）では連携が使えない。Service Binding が Workers 専用のため。<code>/api/warikan/status</code> が404になり、反映ボタンは出ない（正常動作）</li>
+    <li>金額は 10,000,000 円が上限（割り勘アプリ側の制約に合わせている）</li>
+  </ul>
+</section>
+
+<footer>
+  割り勘アプリ連携 — 仕組みと運用。
+  姉妹編: <a href="tech-stack.html">家計ダッシュボード3 の仕様・設計・技術構成</a>。
+  関連: ルートの <code>ROLLBACK_warikan.md</code>（戻し方の手順書）、<code>CLAUDE.md</code>（二重実装の例外として記載）。
+</footer>
+
+</div>
+</body>
+</html>

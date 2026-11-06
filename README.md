@@ -4,6 +4,16 @@
 
 デザインは `DESIGN.md`（PlayStation風デザイントークン + 適用方針）に準拠。
 
+## ドキュメント
+
+| ファイル | 内容 |
+|---|---|
+| [docs/tech-stack.html](docs/tech-stack.html) | 仕様・設計・技術構成の説明書（ブラウザで開く） |
+| [docs/warikan-integration.html](docs/warikan-integration.html) | 割り勘アプリ連携の仕組みと運用 |
+| `DESIGN.md` | デザイン仕様。UI変更前に必ず読む |
+| `CLAUDE.md` | 開発時の作業ガイド |
+| `ROLLBACK_warikan.md` | 割り勘連携の戻し方 |
+
 ## 系統
 
 | 版 | ディレクトリ | 構成 | 状態 |
