@@ -6,9 +6,8 @@
  * Font note: PlayStation SST is proprietary and unavailable. Per the
  * documented substitute guidance this app uses Roboto Light (300) for the
  * display tier and Inter (400/500/600) for body/chrome. The font files are
- * loaded via Google Fonts <link> tags in index.html (kept out of this CSS
- * file so the font request can be preconnected/discovered early by the
- * browser before CSS is parsed).
+ * self-hosted via @fontsource and imported from src/index.css (NOT from
+ * Google Fonts — 外部ドメインへの接続確立を初回描画の直列パスから外すため)。
  */
 
 @import "tailwindcss";
@@ -135,5 +134,29 @@
 
   a {
     color: inherit;
+  }
+}
+
+/*
+ * スマホで画面が拡大・縮小して下部タブバーがずれる問題の対策。
+ * レイヤー外（unlayered）に置くことで、Tailwind の utilities レイヤー（text-[15px] 等）より優先させる。
+ *
+ * - iOS Safari は font-size が 16px 未満の入力欄にフォーカスすると自動でズームする。
+ *   スマホ幅でだけ入力系を 16px にして、その自動ズームを根本から止める（PCの見た目は変えない）。
+ * - touch-action: manipulation でダブルタップ拡大を無効化する。
+ * - 横はみ出しによる横スクロールと、端のゴム引き（オーバースクロール）で固定バーが揺れるのを防ぐ。
+ */
+html,
+body {
+  overflow-x: hidden;
+  overscroll-behavior: none;
+  touch-action: manipulation;
+}
+
+@media (max-width: 767px) {
+  input,
+  select,
+  textarea {
+    font-size: 16px;
   }
 }

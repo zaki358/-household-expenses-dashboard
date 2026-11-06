@@ -7,7 +7,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 
 from api.deps import get_db
-from api.schemas import AmountUpdate, EntryCreate, IndexedEntry
+from api.schemas import EntryCreate, EntryUpdate, IndexedEntry
 from src import repo
 from src.db import Database
 
@@ -24,18 +24,21 @@ async def list_entries(month: str | None = None, group: str | None = None,
 async def create_entry(payload: EntryCreate, db: Database = Depends(get_db)) -> list[IndexedEntry]:
     config = await repo.load_config(db)
     try:
-        return await repo.add_entry(db, config, payload.month, payload.category, payload.amount)
+        return await repo.add_entry(db, config, payload.month, payload.category, payload.amount, payload.note,
+                                   payload.day)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.put("/{entry_id}", response_model=list[IndexedEntry])
-async def update_entry_amount(entry_id: int, payload: AmountUpdate,
-                              db: Database = Depends(get_db)) -> list[IndexedEntry]:
+async def update_entry(entry_id: int, payload: EntryUpdate,
+                       db: Database = Depends(get_db)) -> list[IndexedEntry]:
     if not await repo.entry_exists(db, entry_id):
         raise HTTPException(status_code=404, detail="エントリが存在しません")
+    config = await repo.load_config(db)
     try:
-        return await repo.update_entry_amount(db, entry_id, payload.amount)
+        day = payload.day if "day" in payload.model_fields_set else repo.UNSET
+        return await repo.update_entry(db, config, entry_id, payload.amount, payload.category, payload.note, day)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

@@ -6,7 +6,7 @@ load_config は旧 config.yaml と同じ形の dict を返すため、config.py 
 """
 
 from src.bundle_store import ALL_BUNDLES
-from src.dates import next_month, normalize_month
+from src.dates import current_month, days_in_month, next_month, normalize_month
 
 _SPECS = {spec.key: spec for spec in ALL_BUNDLES}
 FIXED_COST_GROUP = "固定費"
@@ -113,6 +113,25 @@ async def all_months(db) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
+# state（config + dataset + all_months をまとめて取得）
+# --------------------------------------------------------------------------- #
+async def load_state(db) -> tuple[dict, list[dict], list[str], list[str]]:
+    """config・データセット・全月をまとめて取得する（読み取り3エンドポイント共通）。
+
+    TypeScript版（worker/src/repo.ts の loadState）は Cloudflare D1 がネット
+    ワーク越しのサービスであるため、db.batchAll() で9クエリを1往復にまとめて
+    レイテンシを削減している。こちら（ローカル/テスト用の SqliteDatabase）は
+    同一プロセス内のファイルアクセスで往復コストが実質ゼロなため、バッチ化
+    せず素直に逐次呼び出す。戻り値の形（config, rows, warnings, months）は
+    TS版と揃えてあるので、呼び出し側の書き方は対称になる。
+    """
+    config = await load_config(db)
+    rows, warnings = await load_dataset(db, config)
+    months = await all_months(db)
+    return config, rows, warnings, months
+
+
+# --------------------------------------------------------------------------- #
 # entries CRUD
 # --------------------------------------------------------------------------- #
 def _validate_amount(amount) -> int:
@@ -131,9 +150,14 @@ async def list_entries(db, month: str | None = None, group: str | None = None,
 
     取込(import)分（スプレッドシート由来の月次CSV）は集計には使うが、
     このエンドポイントでは編集対象にしない（旧 dashboard_input.csv と同じ挙動）。
+
+    割り勘ID は割り勘アプリへの反映先の支出ID（未反映は None）。反映そのものは
+    Service Binding が必要で Worker 専用だが、JSONの形を TypeScript 版と揃えるため
+    この列も同じキー名で返す。
     """
     rows = await db.all(
-        "SELECT id, month AS 年月, category AS カテゴリ, amount AS 金額 FROM entries "
+        "SELECT id, month AS 年月, category AS カテゴリ, amount AS 金額, note AS 備考, day AS 日, "
+        "warikan_expense_id AS 割り勘ID FROM entries "
         "WHERE source = 'manual' ORDER BY id"
     )
     if month is not None:
@@ -149,7 +173,23 @@ async def entry_exists(db, entry_id: int) -> bool:
     return bool(rows)
 
 
-async def add_entry(db, config: dict, month, category, amount) -> list[dict]:
+# update_entry で「day に触らない」と「day をクリア(None)」を区別するための番兵。
+UNSET = object()
+
+
+def _validate_day(day, month: str) -> int | None:
+    """日（任意）を検証する。None は「日付なし」。1〜その月の末日の整数のみ許可。"""
+    if day is None:
+        return None
+    if isinstance(day, bool) or not isinstance(day, int):
+        raise ValueError("日は整数で入力してください")
+    last = days_in_month(month)
+    if not (1 <= day <= last):
+        raise ValueError(f"日は1〜{last}の範囲で入力してください")
+    return day
+
+
+async def add_entry(db, config: dict, month, category, amount, note: str = "", day=None) -> list[dict]:
     """検証してから entries に1行追加し、更新後の全件を返す。"""
     try:
         normalized_month = normalize_month(month)
@@ -159,16 +199,44 @@ async def add_entry(db, config: dict, month, category, amount) -> list[dict]:
     if cat not in category_to_group(config):
         raise ValueError(f"カテゴリ「{cat}」は登録されていません")
     value = _validate_amount(amount)
+    clean_note = str(note or "").strip()
+    clean_day = _validate_day(day, normalized_month)
     await db.run(
-        "INSERT INTO entries (month, category, amount, source) VALUES (?, ?, ?, 'manual')",
-        (normalized_month, cat, value),
+        "INSERT INTO entries (month, category, amount, note, day, source) VALUES (?, ?, ?, ?, ?, 'manual')",
+        (normalized_month, cat, value, clean_note, clean_day),
     )
     return await list_entries(db)
 
 
-async def update_entry_amount(db, entry_id: int, amount) -> list[dict]:
+async def update_entry(
+    db, config: dict, entry_id: int, amount, category: str | None = None, note: str | None = None,
+    day=UNSET,
+) -> list[dict]:
+    """金額に加え、カテゴリ・備考・日も更新できる。category/note が None ならその列に触らない
+    （amount だけの旧呼び出しとの後方互換のため）。note に空文字を渡すのは「クリア」扱い。
+    day は UNSET（既定）なら触らず、None なら日付をクリアする。
+    """
     value = _validate_amount(amount)
-    await db.run("UPDATE entries SET amount = ? WHERE id = ? AND source = 'manual'", (value, entry_id))
+    sets = ["amount = ?"]
+    params: list = [value]
+
+    if category is not None:
+        cat = category.strip()
+        if cat not in category_to_group(config):
+            raise ValueError(f"カテゴリ「{cat}」は登録されていません")
+        sets.append("category = ?")
+        params.append(cat)
+    if note is not None:
+        sets.append("note = ?")
+        params.append(note.strip())
+    if day is not UNSET:
+        rows = await db.all("SELECT month FROM entries WHERE id = ?", (entry_id,))
+        if rows:
+            sets.append("day = ?")
+            params.append(_validate_day(day, rows[0]["month"]))
+
+    params.append(entry_id)
+    await db.run(f"UPDATE entries SET {', '.join(sets)} WHERE id = ? AND source = 'manual'", tuple(params))
     return await list_entries(db)
 
 
@@ -216,8 +284,31 @@ async def add_bundle_item(db, kind: str, month, name, amount) -> list[dict]:
     return await list_bundle_items(db, kind)
 
 
-async def update_bundle_amount(db, kind: str, item_id: int, amount) -> list[dict]:
+async def update_bundle_item(db, kind: str, item_id: int, amount, name: str | None = None) -> list[dict]:
+    """金額に加え、項目名も更新できる。name が None ならその列に触らない
+    （amount だけの旧呼び出しとの後方互換のため）。
+    """
     value = _validate_amount(amount)
+
+    if name is not None:
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValueError("名前が空です")
+        row = await db.all("SELECT month FROM bundle_items WHERE id = ? AND kind = ?", (item_id, kind))
+        if row:
+            month = row[0]["month"]
+            dup = await db.all(
+                "SELECT 1 FROM bundle_items WHERE kind = ? AND month = ? AND name = ? AND id != ?",
+                (kind, month, clean_name, item_id),
+            )
+            if dup:
+                raise ValueError(f"「{clean_name}」は{month}にすでに登録されています")
+        await db.run(
+            "UPDATE bundle_items SET amount = ?, name = ? WHERE id = ? AND kind = ?",
+            (value, clean_name, item_id, kind),
+        )
+        return await list_bundle_items(db, kind)
+
     await db.run("UPDATE bundle_items SET amount = ? WHERE id = ? AND kind = ?", (value, item_id, kind))
     return await list_bundle_items(db, kind)
 
@@ -354,58 +445,160 @@ async def remove_category(db, name: str, config: dict | None = None) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 翌月作成（固定費・バンドルの引き継ぎ）
+# 月の準備（固定費・バンドルの引き継ぎ）— ensure_month / ensure_current_month / create_next_month
 # --------------------------------------------------------------------------- #
-async def create_next_month(db, config: dict | None = None) -> str:
-    """翌月を作成し、作成した月(YYYY-MM)を返す。
+async def previous_data_month(db, target: str) -> str | None:
+    """target より前で実データ（entries または bundle_items）を持つ最新月。無ければ None。
 
-    先月の固定費入力とサブスク・通信費を引き継ぎ、dashboard_months に登録する。
-    既に対象月へ引き継ぎ済みなら二重登録しない（冪等）。
+    dashboard_months は意図的にUNIONしない — 迷子の未来月や中身が空の準備済み月が
+    base に選ばれるのを防ぐため（前者は all_months() の最大値を base にすると起きる事故、
+    後者は「準備はしたが引き継ぐものが無かった月」を base にすると何も引き継がれない事故）。
     """
-    config = config or await load_config(db)
+    rows = await db.all(
+        "SELECT MAX(month) AS m FROM ("
+        " SELECT month FROM entries WHERE month < ?"
+        " UNION"
+        " SELECT month FROM bundle_items WHERE month < ?"
+        ")",
+        (target, target),
+    )
+    return rows[0]["m"] if rows and rows[0]["m"] is not None else None
+
+
+async def ensure_month(db, month, config: dict | None = None) -> dict:
+    """指定した月(month)を準備する: 直前の実データ月から固定費・サブスク・通信費を引き継ぎ、
+    dashboard_months に登録する。既に登録済みなら何もせず {"created": False} を返す（冪等）。
+
+    このマーカーが「準備後に手動で全部消しても再度引き継がれない」ことを保証する
+    （all_months() は dashboard_months をUNIONするため、その月は summary.months に残り続け、
+    呼び出し側の「今月がまだ無い」判定が再び真になることはない）。
+
+    create_next_month と将来の自動準備トリガーが共有する唯一の実装（TS版 worker/src/repo.ts
+    の ensureMonth と対）。
+    """
+    try:
+        target = normalize_month(month)
+    except Exception:
+        raise ValueError("年月の形式が不正です（例: 2026-08）")
+
+    already = await db.all("SELECT 1 FROM dashboard_months WHERE month = ? LIMIT 1", (target,))
+    if already:
+        return {"month": target, "created": False, "base": None, "carried_entries": 0, "carried_bundle_items": 0}
+
+    base = await previous_data_month(db, target)
+    statements: list[tuple[str, tuple]] = []
+    carried_entries = 0
+    carried_bundle_items = 0
+
+    if base is not None:
+        config = config or await load_config(db)
+        mapping = category_to_group(config)
+        fixed_cats = [c for c, g in mapping.items() if g == FIXED_COST_GROUP]
+
+        # 固定費エントリの引き継ぎ（対象月に固定費が無いときだけ）
+        if fixed_cats:
+            placeholders = ",".join("?" for _ in fixed_cats)
+            already_fixed = await db.all(
+                f"SELECT 1 FROM entries WHERE month = ? AND category IN ({placeholders}) LIMIT 1",
+                (target, *fixed_cats),
+            )
+            if not already_fixed:
+                base_fixed = await db.all(
+                    f"SELECT category, amount, note FROM entries WHERE month = ? AND category IN ({placeholders}) ORDER BY id",
+                    (base, *fixed_cats),
+                )
+                for row in base_fixed:
+                    statements.append((
+                        "INSERT INTO entries (month, category, amount, note, source) VALUES (?, ?, ?, ?, 'manual')",
+                        (target, row["category"], row["amount"], row["note"]),
+                    ))
+                    carried_entries += 1
+
+        # サブスク・通信費の引き継ぎ（対象月に項目が無いときだけ）
+        for spec in ALL_BUNDLES:
+            has_target = await db.all(
+                "SELECT 1 FROM bundle_items WHERE kind = ? AND month = ? LIMIT 1", (spec.key, target)
+            )
+            if has_target:
+                continue
+            base_items = await db.all(
+                "SELECT name, amount FROM bundle_items WHERE kind = ? AND month = ? ORDER BY id",
+                (spec.key, base),
+            )
+            for row in base_items:
+                statements.append((
+                    # UNIQUE (kind, month, name) があるため OR IGNORE で途中失敗後の再試行を安全にする
+                    "INSERT OR IGNORE INTO bundle_items (kind, month, name, amount) VALUES (?, ?, ?, ?)",
+                    (spec.key, target, row["name"], row["amount"]),
+                ))
+                carried_bundle_items += 1
+
+    statements.append(("INSERT OR IGNORE INTO dashboard_months (month) VALUES (?)", (target,)))
+    # 1トランザクションにまとめ、「半分だけ引き継がれた月」が起きないようにする
+    await db.batch(statements)
+
+    return {
+        "month": target,
+        "created": True,
+        "base": base,
+        "carried_entries": carried_entries,
+        "carried_bundle_items": carried_bundle_items,
+    }
+
+
+async def ensure_current_month(db, config: dict | None = None, today: str | None = None) -> dict:
+    """今月(JST)を準備する。データが一件も無い完全な初回起動では何もしない
+    （base が無いので引き継ぐ物も無く、marker だけ書くのを避けて空状態のオンボーディングを保つ）。
+    """
+    target = today or current_month()
+    months = await all_months(db)
+    if not months:
+        return {"month": target, "created": False, "base": None, "carried_entries": 0, "carried_bundle_items": 0}
+    return await ensure_month(db, target, config)
+
+
+async def create_next_month(db, config: dict | None = None) -> str:
+    """翌月を作成し、作成した月(YYYY-MM)を返す（設定タブの「➕ 翌月を作成」ボタン用）。"""
     months = await all_months(db)
     if not months:
         raise ValueError("基準となる月がありません。先に当月のデータを入力してください。")
-    base = months[-1]
-    target = next_month(base)
+    target = next_month(months[-1])
+    result = await ensure_month(db, target, config)
+    return result["month"]
 
-    mapping = category_to_group(config)
-    fixed_cats = [c for c, g in mapping.items() if g == FIXED_COST_GROUP]
 
-    # 固定費エントリの引き継ぎ（対象月に固定費が無いときだけ）
-    if fixed_cats:
-        placeholders = ",".join("?" for _ in fixed_cats)
-        already = await db.all(
-            f"SELECT 1 FROM entries WHERE month = ? AND category IN ({placeholders}) LIMIT 1",
-            (target, *fixed_cats),
-        )
-        if not already:
-            base_fixed = await db.all(
-                f"SELECT category, amount FROM entries WHERE month = ? AND category IN ({placeholders}) ORDER BY id",
-                (base, *fixed_cats),
-            )
-            for row in base_fixed:
-                await db.run(
-                    "INSERT INTO entries (month, category, amount, source) VALUES (?, ?, ?, 'manual')",
-                    (target, row["category"], row["amount"]),
-                )
+# --------------------------------------------------------------------------- #
+# 月削除（誤って作成した翌月シートの取り消し用）
+# --------------------------------------------------------------------------- #
+async def delete_month(db, month, today: str | None = None) -> dict:
+    """指定した月の entries・bundle_items・dashboard_months をまとめて削除する。
 
-    # サブスク・通信費の引き継ぎ（対象月に項目が無いときだけ）
-    for spec in ALL_BUNDLES:
-        has_target = await db.all(
-            "SELECT 1 FROM bundle_items WHERE kind = ? AND month = ? LIMIT 1", (spec.key, target)
-        )
-        if has_target:
-            continue
-        base_items = await db.all(
-            "SELECT name, amount FROM bundle_items WHERE kind = ? AND month = ? ORDER BY id",
-            (spec.key, base),
-        )
-        for row in base_items:
-            await db.run(
-                "INSERT INTO bundle_items (kind, month, name, amount) VALUES (?, ?, ?, ?)",
-                (spec.key, target, row["name"], row["amount"]),
-            )
+    「1つの月」はこの3テーブルに分散しており外部キーも無いため、3つとも消さないと
+    all_months()（UNION）にその月が残ってしまう。db.batch は1トランザクションなので、
+    ここに乗せることで一部だけ消える事故を防ぐ（TS版 worker/src/repo.ts の deleteMonth と対）。
 
-    await db.run("INSERT OR IGNORE INTO dashboard_months (month) VALUES (?)", (target,))
-    return target
+    中間の月を消すと monthlySummary の累計（貯金・投資・純資産）が以降の全月でズレるため、
+    「今月より後」の月のみ許可する。source（manual/import）は問わず、その月の行は
+    すべて削除する（source='manual' に絞ると import 行が残り「消したのに月が消えない」
+    事故になる）。
+    """
+    try:
+        target = normalize_month(month)
+    except Exception:
+        raise ValueError("年月の形式が不正です（例: 2026-08）")
+    current = today or current_month()
+    if target <= current:
+        raise ValueError(f"{target} は削除できません。今月({current})より後の月のみ削除できます。")
+
+    entries_count = await db.all("SELECT COUNT(*) AS c FROM entries WHERE month = ?", (target,))
+    bundle_count = await db.all("SELECT COUNT(*) AS c FROM bundle_items WHERE month = ?", (target,))
+    deleted_entries = int(entries_count[0]["c"]) if entries_count else 0
+    deleted_bundle_items = int(bundle_count[0]["c"]) if bundle_count else 0
+
+    await db.batch([
+        ("DELETE FROM entries WHERE month = ?", (target,)),
+        ("DELETE FROM bundle_items WHERE month = ?", (target,)),
+        ("DELETE FROM dashboard_months WHERE month = ?", (target,)),
+    ])
+
+    return {"month": target, "deleted_entries": deleted_entries, "deleted_bundle_items": deleted_bundle_items}

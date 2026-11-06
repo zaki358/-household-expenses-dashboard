@@ -12,6 +12,8 @@ from datetime import date
 from src.repo import category_to_group
 
 REQUIRED_COLUMNS = ["年月", "カテゴリ", "金額"]
+# 任意列。無い CSV（従来形式）もそのまま通す。
+NOTE_COLUMN = "備考"
 ENCODINGS = ["utf-8-sig", "cp932"]
 
 
@@ -79,8 +81,9 @@ def analyze_entries_csv(raw: bytes, config: dict, today: date | None = None) -> 
             continue
         if category not in mapping:
             unknown.add(category)
+        note = row.get(NOTE_COLUMN, "") if NOTE_COLUMN in fields else ""
         proposals.append({"行": line_no, "変更前年月": before or "（空欄）",
-                          "年月": after, "カテゴリ": category, "金額": amount})
+                          "年月": after, "カテゴリ": category, "金額": amount, "備考": note})
 
     return {"ok": True, "error": None, "proposals": proposals,
             "skipped": skipped, "unknown_categories": sorted(unknown)}
@@ -89,8 +92,8 @@ def analyze_entries_csv(raw: bytes, config: dict, today: date | None = None) -> 
 async def commit_entries(db, proposals: list[dict]) -> int:
     """proposals を entries(source='import') に投入し、件数を返す。"""
     statements = [
-        ("INSERT INTO entries (month, category, amount, source) VALUES (?, ?, ?, 'import')",
-         (p["年月"], p["カテゴリ"], p["金額"]))
+        ("INSERT INTO entries (month, category, amount, note, source) VALUES (?, ?, ?, ?, 'import')",
+         (p["年月"], p["カテゴリ"], p["金額"], p.get("備考", "")))
         for p in proposals
     ]
     if statements:

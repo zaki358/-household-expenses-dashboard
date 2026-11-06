@@ -17,10 +17,10 @@ def _to_csv(header: list[str], rows: list[list]) -> str:
 
 
 async def export_entries_csv(db) -> str:
-    """全 entries（手入力＋取込）を 年月,カテゴリ,金額 のCSV文字列で返す。"""
-    rows = await db.all("SELECT month, category, amount FROM entries ORDER BY month, id")
-    return _to_csv(["年月", "カテゴリ", "金額"],
-                   [[r["month"], r["category"], r["amount"]] for r in rows])
+    """全 entries（手入力＋取込）を 年月,カテゴリ,金額,備考 のCSV文字列で返す。"""
+    rows = await db.all("SELECT month, category, amount, note FROM entries ORDER BY month, id")
+    return _to_csv(["年月", "カテゴリ", "金額", "備考"],
+                   [[r["month"], r["category"], r["amount"], r["note"]] for r in rows])
 
 
 async def export_bundle_csv(db, kind: str) -> str:

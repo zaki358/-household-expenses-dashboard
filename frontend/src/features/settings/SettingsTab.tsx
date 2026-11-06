@@ -6,10 +6,12 @@ import {
   createNextMonth,
   deleteCategory,
   deleteGoal,
+  deleteMonth,
   exportBundleUrl,
   exportEntriesUrl,
   getConfig,
   getGoals,
+  getSummary,
   importCsv,
   setActiveGoal,
   updateInvestmentMode,
@@ -328,6 +330,35 @@ function NextMonthSection() {
   const [error, setError] = useState<string | null>(null)
   const [successMsg, setSuccessMsg] = useState<string | null>(null)
 
+  // 削除できる月の一覧（今月より後のみ）。実際の許可判定はサーバー側（deleteMonth）が正で、
+  // ここでの絞り込みは表示用（今月・過去月のボタンをそもそも出さないため）。
+  const [months, setMonths] = useState<string[]>([])
+  const [monthsLoading, setMonthsLoading] = useState(true)
+  const [selectedMonth, setSelectedMonth] = useState<string | null>(null)
+  const [confirmText, setConfirmText] = useState('')
+  const [deleting, setDeleting] = useState(false)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
+  const [deleteSuccessMsg, setDeleteSuccessMsg] = useState<string | null>(null)
+
+  // サーバー(JST)の今月。deleteMonth のガードもJST基準なので、ここもブラウザ時計に頼らずサーバーに合わせる。
+  const [todayMonth, setTodayMonth] = useState<string | null>(null)
+
+  const refreshMonths = () => {
+    setMonthsLoading(true)
+    getSummary()
+      .then((s) => {
+        setMonths(s.months)
+        setTodayMonth(s.current_month)
+      })
+      .catch(() => setMonths([]))
+      .finally(() => setMonthsLoading(false))
+  }
+
+  useEffect(() => { refreshMonths() }, [])
+
+  // YYYY-MM は辞書順=時系列順で比較できる。todayMonth 未取得の間は何も表示しない（誤って過去月を出さない）。
+  const deletableMonths = todayMonth ? months.filter((m) => m > todayMonth).sort() : []
+
   const handleCreate = async () => {
     setLoading(true)
     setError(null)
@@ -335,10 +366,41 @@ function NextMonthSection() {
     try {
       const result = await createNextMonth()
       setSuccessMsg(`${result.month} を作成しました。`)
+      refreshMonths()
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'エラーが発生しました')
     } finally {
       setLoading(false)
+    }
+  }
+
+  const selectMonthToDelete = (m: string) => {
+    setSelectedMonth(m)
+    setConfirmText('')
+    setDeleteError(null)
+    setDeleteSuccessMsg(null)
+  }
+
+  const cancelDelete = () => {
+    setSelectedMonth(null)
+    setConfirmText('')
+    setDeleteError(null)
+  }
+
+  const handleDelete = async () => {
+    if (!selectedMonth) return
+    setDeleting(true)
+    setDeleteError(null)
+    try {
+      await deleteMonth(selectedMonth)
+      setDeleteSuccessMsg(`${selectedMonth} を削除しました。`)
+      setSelectedMonth(null)
+      setConfirmText('')
+      refreshMonths()
+    } catch (e: unknown) {
+      setDeleteError(e instanceof Error ? e.message : '削除に失敗しました')
+    } finally {
+      setDeleting(false)
     }
   }
 
@@ -355,6 +417,63 @@ function NextMonthSection() {
       </div>
       {error && <p className="mt-xs font-body text-[13px] text-warning">{error}</p>}
       {successMsg && <p className="mt-xs font-body text-[13px] text-link-dark">{successMsg}</p>}
+
+      <div className="mt-lg">
+        <p className="font-body text-[13px] font-medium text-on-dark mb-sm">誤って作成した月を削除</p>
+        <p className="mb-sm font-body text-[12px] leading-[1.8] text-mute-dark">
+          今月より後に作成した月だけ削除できます（今月・過去月は保護されています）。
+        </p>
+        {!monthsLoading && deletableMonths.length === 0 && (
+          <p className="font-body text-[13px] text-mute-dark">削除できる月はありません。</p>
+        )}
+        {deletableMonths.length > 0 && (
+          <div className="flex flex-wrap gap-xs">
+            {deletableMonths.map((m) => (
+              <button
+                key={m}
+                type="button"
+                onClick={() => selectMonthToDelete(m)}
+                className={`font-body text-[13px] px-md py-sm rounded-sm border transition-colors ${
+                  selectedMonth === m
+                    ? 'border-warning text-warning'
+                    : 'border-hairline-dark text-on-dark hover:border-mute-dark'
+                }`}
+              >
+                {m}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {selectedMonth && (
+          <div className="mt-md rounded-sm border border-warning p-md">
+            <p className="font-body text-[13px] text-warning">
+              ⚠ {selectedMonth} のデータ（収入・支出・サブスク等）をすべて削除します。この操作は取り消せません。
+            </p>
+            <p className="mt-xs font-body text-[13px] text-on-dark">
+              確認のため、削除する月「{selectedMonth}」を入力してください。
+            </p>
+            <div className="mt-sm flex flex-wrap gap-sm items-end">
+              <TextInput
+                value={confirmText}
+                onChange={(e) => setConfirmText(e.target.value)}
+                placeholder={selectedMonth}
+                className="w-36"
+              />
+              <Button
+                size="sm"
+                variant={deleting || confirmText !== selectedMonth ? 'disabled' : 'danger'}
+                onClick={handleDelete}
+              >
+                削除する
+              </Button>
+              <Button size="sm" variant="secondary" onClick={cancelDelete}>キャンセル</Button>
+            </div>
+            {deleteError && <p className="mt-xs font-body text-[13px] text-warning">{deleteError}</p>}
+          </div>
+        )}
+        {deleteSuccessMsg && <p className="mt-sm font-body text-[13px] text-link-dark">{deleteSuccessMsg}</p>}
+      </div>
     </div>
   )
 }

@@ -1,1 +1,16 @@
+/*
+ * フォントは自己ホスト（@fontsource）。Google Fonts の <link> は index.html から
+ * 削除済み。外部2ドメイン(fonts.googleapis.com / fonts.gstatic.com)への
+ * DNS+TLS 確立が初回描画の直列パスに入るのを避けるため。
+ *
+ * 画面の文字はほとんど日本語で、Inter/Roboto は日本語グリフを持たない
+ * （= システムフォントにフォールバックする）ので latin サブセットだけで足りる。
+ * 使用ウェイトは global.css の --font-body / --font-display に対応:
+ *   Inter 400/500/600 = body/chrome、Roboto 300 = display
+ */
+@import '@fontsource/inter/latin-400.css';
+@import '@fontsource/inter/latin-500.css';
+@import '@fontsource/inter/latin-600.css';
+@import '@fontsource/roboto/latin-300.css';
+
 @import './theme/global.css';

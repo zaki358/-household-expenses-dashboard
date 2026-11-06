@@ -13,18 +13,29 @@ import {
   previousMonth,
   compareMonths,
 } from './aggregate'
+import { currentMonth } from './dates'
 import { goalStatus } from './goal'
 import { analyzeEntriesCsv, commitEntries } from './importer'
 import { exportEntriesCsv, exportBundleCsv } from './exporter'
 import * as repo from './repo'
 import { ValidationError } from './repo'
+import { HttpError } from './errors'
+import {
+  buildExpensePayload,
+  createWarikanExpense,
+  deleteWarikanExpense,
+  isWarikanEnabled,
+  listWarikanUsers,
+  type WarikanConfig,
+} from './warikan'
 
-type Bindings = { DB: D1Database; ACCESS_ALLOWED_EMAILS?: string }
-
-class HttpError extends Error {
-  constructor(public status: number, public detail: string) {
-    super(detail)
-  }
+type Bindings = {
+  DB: D1Database
+  ACCESS_ALLOWED_EMAILS?: string
+  /** 割り勘アプリ(warikan Worker)への Service Binding。未設定なら連携は無効。 */
+  WARIKAN?: Fetcher
+  /** 割り勘アプリの内部APIを呼ぶための共有トークン。未設定なら連携は無効。 */
+  WARIKAN_INTERNAL_TOKEN?: string
 }
 
 const VALID_KINDS = new Set(['subscriptions', 'communications'])
@@ -45,14 +56,25 @@ app.use('/api/*', async (c, next) => {
   await next()
 })
 
+// 計測用: Worker内でハンドラに費やした時間を Server-Timing で返す。
+// ブラウザが観測した総時間との差が、Access検証・TLS・ネットワーク往復などの固定コスト。
+app.use('/api/*', async (c, next) => {
+  const started = Date.now()
+  await next()
+  c.res.headers.set('Server-Timing', `worker;dur=${Date.now() - started}`)
+})
+
 function db(c: { env: Bindings }): DB {
   return makeDb(c.env.DB)
 }
 
+function warikan(c: { env: Bindings }): WarikanConfig {
+  return { service: c.env.WARIKAN, token: c.env.WARIKAN_INTERNAL_TOKEN }
+}
+
 async function getState(database: DB) {
-  const config = await repo.loadConfig(database)
-  const { rows, warnings } = await repo.loadDataset(database, config)
-  const months = await repo.allMonths(database)
+  // D1への往復を9回→1回にまとめる (repo.loadState は batchAll を使う)
+  const { config, rows, warnings, months } = await repo.loadState(database)
   const summary = monthlySummary(rows, config, months)
   return { config, rows, warnings, summary, months }
 }
@@ -79,7 +101,7 @@ app.get('/api/health', (c) => c.json({ status: 'ok' }))
 
 app.get('/api/summary', async (c) => {
   const { warnings, summary, months } = await getState(db(c))
-  return c.json({ months, summary, warnings })
+  return c.json({ months, summary, warnings, current_month: currentMonth() })
 })
 
 app.get('/api/dashboard', async (c) => {
@@ -115,26 +137,77 @@ app.get('/api/entries', async (c) => {
 })
 
 app.post('/api/entries', async (c) => {
-  const body = await c.req.json<{ month: string; category: string; amount: number }>()
+  const body = await c.req.json<{ month: string; category: string; amount: number; note?: string; day?: number | null }>()
   const database = db(c)
   const config = await repo.loadConfig(database)
-  const updated = await repo.addEntry(database, config, body.month, body.category, body.amount)
+  const updated = await repo.addEntry(database, config, body.month, body.category, body.amount, body.note, body.day)
   return c.json(updated)
 })
 
 app.put('/api/entries/:id', async (c) => {
   const id = Number(c.req.param('id'))
   const database = db(c)
-  if (!(await repo.entryExists(database, id))) throw new HttpError(404, 'エントリが存在しません')
-  const body = await c.req.json<{ amount: number }>()
-  return c.json(await repo.updateEntryAmount(database, id, body.amount))
+  const body = await c.req.json<{ amount: number; category?: string; note?: string; day?: number | null }>()
+  const [exists, config] = await Promise.all([repo.entryExists(database, id), repo.loadConfig(database)])
+  if (!exists) throw new HttpError(404, 'エントリが存在しません')
+  return c.json(await repo.updateEntry(database, config, id, body.amount, body.category, body.note, body.day))
 })
 
 app.delete('/api/entries/:id', async (c) => {
   const id = Number(c.req.param('id'))
   const database = db(c)
-  if (!(await repo.entryExists(database, id))) throw new HttpError(404, 'エントリが存在しません')
+  const entry = await repo.findEntryById(database, id)
+  if (entry === null) throw new HttpError(404, 'エントリが存在しません')
+  // 割り勘に反映済みのまま家計簿だけ消すと、割り勘側に由来不明の支出が残り
+  // 取り消す手段も失われる。連携が有効なときだけ止める（連携を切った後は普通に消せる）。
+  if (entry.割り勘ID !== null && isWarikanEnabled(warikan(c))) {
+    throw new HttpError(409, '先に割り勘への反映を取り消してください')
+  }
   return c.json(await repo.deleteEntry(database, id))
+})
+
+// --------------------------------------------------------------------------- //
+// 割り勘アプリ連携（Service Binding 経由。Worker専用で Python版には無い）
+// --------------------------------------------------------------------------- //
+
+// フロントはこれを見て反映ボタンを出すか決める。
+// 連携を切った（バインディングかシークレットを外した）あとは false になり、
+// 画面は連携前とまったく同じ見た目に戻る。
+app.get('/api/warikan/status', (c) => c.json({ enabled: isWarikanEnabled(warikan(c)) }))
+
+app.get('/api/warikan/users', async (c) => {
+  return c.json(await listWarikanUsers(warikan(c)))
+})
+
+app.post('/api/entries/:id/warikan', async (c) => {
+  const id = Number(c.req.param('id'))
+  const body = await c.req.json<{ paid_by?: string }>().catch(() => ({ paid_by: undefined }))
+  const database = db(c)
+
+  const entry = await repo.findEntryById(database, id)
+  if (entry === null) throw new HttpError(404, 'エントリが存在しません')
+  if (entry.割り勘ID !== null) throw new HttpError(409, '既に割り勘へ反映済みです')
+
+  const payload = buildExpensePayload(entry, body.paid_by ?? '')
+  const result = await createWarikanExpense(warikan(c), payload)
+  await repo.setWarikanExpenseId(database, id, result.id)
+
+  return c.json(await repo.listEntries(database))
+})
+
+app.delete('/api/entries/:id/warikan', async (c) => {
+  const id = Number(c.req.param('id'))
+  const database = db(c)
+
+  const entry = await repo.findEntryById(database, id)
+  if (entry === null) throw new HttpError(404, 'エントリが存在しません')
+  if (entry.割り勘ID === null) throw new HttpError(404, '割り勘へ反映されていません')
+
+  // 割り勘側に既に無い場合も成功扱い。家計簿側の記録をクリアして整合を取る。
+  await deleteWarikanExpense(warikan(c), entry.割り勘ID)
+  await repo.setWarikanExpenseId(database, id, null)
+
+  return c.json(await repo.listEntries(database))
 })
 
 // --------------------------------------------------------------------------- //
@@ -163,8 +236,8 @@ app.put('/api/bundles/:kind/:id', async (c) => {
   const id = Number(c.req.param('id'))
   const database = db(c)
   if (!(await repo.bundleItemExists(database, id, kind))) throw new HttpError(404, '項目が存在しません')
-  const body = await c.req.json<{ amount: number }>()
-  return c.json(await repo.updateBundleAmount(database, kind, id, body.amount))
+  const body = await c.req.json<{ amount: number; name?: string }>()
+  return c.json(await repo.updateBundleItem(database, kind, id, body.amount, body.name))
 })
 
 app.delete('/api/bundles/:kind/:id', async (c) => {
@@ -214,15 +287,28 @@ app.post('/api/months/next', async (c) => {
   return c.json({ month: target })
 })
 
+// 当月シートの自動準備。フロントがマウント時に1回だけ叩く（App.tsx）。
+app.post('/api/months/ensure-current', async (c) => {
+  const result = await repo.ensureCurrentMonth(db(c))
+  return c.json(result)
+})
+
+// 誤って作成した翌月シートの取り消し用。今月より後の月のみ削除できる（repo.deleteMonth 側で強制）。
+app.delete('/api/months/:month', async (c) => {
+  const result = await repo.deleteMonth(db(c), decodeURIComponent(c.req.param('month')))
+  return c.json(result)
+})
+
 // --------------------------------------------------------------------------- //
 // config
 // --------------------------------------------------------------------------- //
 async function configOut(database: DB) {
-  const config = await repo.loadConfig(database)
+  // config とカテゴリ使用件数を D1 への1往復でまとめて取得する。
+  const { config, usage } = await repo.loadConfigWithUsage(database)
   return {
     investment_as_expense: config.investment_as_expense,
     categories: config.categories,
-    category_usage: await repo.categoryUsage(database),
+    category_usage: usage,
     active_goal: config.active_goal,
     dashboard_months: config.dashboard_months,
   }

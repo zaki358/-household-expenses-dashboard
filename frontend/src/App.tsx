@@ -1,16 +1,18 @@
-import { useEffect, useMemo, useState } from 'react'
-import { getSummary } from './api/client'
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
+import { ensureCurrentMonth, getSummary } from './api/client'
 import { Badge } from './components/Badge'
 import { Band } from './components/Band'
 import { Container } from './components/Container'
 import { MonthSelector } from './components/MonthSelector'
 import { Nav } from './components/Nav'
 import { SectionTitle } from './components/SectionTitle'
-import { ChartsTab } from './features/charts/ChartsTab'
 import { Dashboard } from './features/dashboard/Dashboard'
 import { EntryTab } from './features/entry/EntryTab'
 import { GoalTab } from './features/goal/GoalTab'
 import { SettingsTab } from './features/settings/SettingsTab'
+
+// recharts(+d3)を引くグラフタブだけ遅延ロードし、初回JSバンドルから除外する。
+const ChartsTab = lazy(() => import('./features/charts/ChartsTab').then((m) => ({ default: m.ChartsTab })))
 
 type Tab = 'dashboard' | 'charts' | 'entry' | 'goal' | 'settings'
 
@@ -43,16 +45,45 @@ const TAB_ICONS: Record<Tab, string> = {
 const MONTH_TABS = new Set<Tab>(['dashboard', 'charts', 'entry'])
 
 function App() {
-  const [tab, setTab] = useState<Tab>('dashboard')
-  const [dataMonths, setDataMonths] = useState<string[]>([])
+  // 起動時は「入力」タブ。最も開く頻度が高い画面のため。
+  const [tab, setTab] = useState<Tab>('entry')
+  // null = summary 未解決（読み込み中）。[] と区別することで、summary を待たずに
+  // Dashboard/ChartsTab を楽観的に描き始められる。
+  const [dataMonths, setDataMonths] = useState<string[] | null>(null)
   const [month, setMonth] = useState<string | null>(null)
   const [warnings, setWarnings] = useState<string[]>([])
 
   // 今月 (YYYY-MM)。マウント時に一度だけ確定する（render毎に new Date() しない）。
-  const [todayMonth] = useState(() => {
+  // サーバー(JST)の応答が届くまでのプレースホルダに過ぎない — 端末TZがJSTとズレていると
+  // ブラウザローカル時刻はサーバーの「今月」と食い違いうるため、真実の源にはしない。
+  const [browserMonth] = useState(() => {
     const d = new Date()
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
   })
+  // /api/summary の current_month（JST）。届き次第これを今月として採用する。
+  const [serverMonth, setServerMonth] = useState<string | null>(null)
+  // 当月シートが自動準備されたときに EntryTab 等を作り直すためのバージョン番号。
+  const [dataVersion, setDataVersion] = useState(0)
+  // 自動準備で今月が新規作成された場合、その月をここに入れて1行通知する。
+  const [ensuredMonth, setEnsuredMonth] = useState<string | null>(null)
+
+  // 当月シートの自動準備。マウント時に1回だけ POST する。
+  const bootstrapped = useRef(false)
+  useEffect(() => {
+    if (bootstrapped.current) return
+    bootstrapped.current = true // await の前に立てる（StrictModeの二重マウントでも1回だけ発火させる）
+    ensureCurrentMonth()
+      .then((result) => {
+        setServerMonth(result.month)
+        if (result.created) {
+          setDataVersion((v) => v + 1)
+          setEnsuredMonth(result.month)
+        }
+      })
+      .catch(() => {
+        /* 失敗しても表示は継続する（従来どおりの見た目のまま） */
+      })
+  }, [])
 
   useEffect(() => {
     if (!MONTH_TABS.has(tab)) return
@@ -60,21 +91,31 @@ function App() {
       .then((summary) => {
         setDataMonths(summary.months)
         setWarnings(summary.warnings)
+        setServerMonth(summary.current_month)
       })
       .catch(() => {
         setDataMonths([])
       })
-  }, [tab])
+  }, [tab, dataVersion])
 
-  // 表示・入力の対象月。ユーザーが明示的に選んでいなければ必ず今月。
+  // 表示・入力の対象月。ユーザーが明示的に選んでいなければ、サーバーの今月（無ければブラウザの今月）。
+  const todayMonth = serverMonth ?? browserMonth
   const selectedMonth = month ?? todayMonth
+  const displayWarnings = ensuredMonth
+    ? [...warnings, `${ensuredMonth} を作成し、固定費・サブスクを引き継ぎました`]
+    : warnings
+  const summaryLoading = dataMonths === null
+  const months = dataMonths ?? []
   // 月ピル = データがある月 ∪ 今月（YYYY-MM文字列なので辞書順=時系列順）
+  // dataMonths(stateそのもの)を依存にする — `months`は毎レンダー新規配列になりうるため。
   const pillMonths = useMemo(
-    () => Array.from(new Set([...dataMonths, todayMonth])).sort(),
+    () => Array.from(new Set([...(dataMonths ?? []), todayMonth])).sort(),
     [dataMonths, todayMonth],
   )
-  const selectedMonthHasData = dataMonths.includes(selectedMonth)
-  const hasAnyData = dataMonths.length > 0
+  const selectedMonthHasData = months.includes(selectedMonth)
+  const hasAnyData = months.length > 0
+  // summary の解決を待たずに描き始める。データが無いと確定した時点で空状態に差し替える。
+  const showDashboard = summaryLoading || selectedMonthHasData
 
   const showMonthBar = MONTH_TABS.has(tab)
 
@@ -103,10 +144,10 @@ function App() {
         rightCluster={<Badge>v0</Badge>}
       />
 
-      {warnings.length > 0 && (
+      {displayWarnings.length > 0 && (
         <Band variant="light" className="py-md!">
           <Container>
-            {warnings.map((warning) => (
+            {displayWarnings.map((warning) => (
               <p key={warning} className="font-body text-[14px] leading-[1.8] text-warning">
                 ⚠ {warning}
               </p>
@@ -125,7 +166,8 @@ function App() {
 
       <Band variant="dark" className="py-xxl! px-lg!">
         <Container>
-          {tab === 'dashboard' && !hasAnyData && (
+          {tab === 'dashboard' && showDashboard && <Dashboard month={selectedMonth} />}
+          {tab === 'dashboard' && !summaryLoading && !hasAnyData && (
             <div>
               <SectionTitle level="heading-lg">データがありません</SectionTitle>
               <p className="mt-sm font-body text-[16px] leading-[1.8] text-mute-dark">
@@ -135,7 +177,7 @@ function App() {
               </p>
             </div>
           )}
-          {tab === 'dashboard' && hasAnyData && !selectedMonthHasData && (
+          {tab === 'dashboard' && !summaryLoading && hasAnyData && !selectedMonthHasData && (
             <div>
               <SectionTitle level="heading-lg">{selectedMonth} のデータはまだありません</SectionTitle>
               <p className="mt-sm font-body text-[16px] leading-[1.8] text-mute-dark">
@@ -143,21 +185,28 @@ function App() {
               </p>
             </div>
           )}
-          {tab === 'dashboard' && selectedMonthHasData && <Dashboard month={selectedMonth} />}
 
-          {tab === 'charts' && !hasAnyData && (
+          {tab === 'charts' && showDashboard && (
+            <Suspense
+              fallback={
+                <p className="font-body text-[16px] leading-[1.8] text-mute-dark">読み込み中...</p>
+              }
+            >
+              <ChartsTab month={selectedMonth} />
+            </Suspense>
+          )}
+          {tab === 'charts' && !summaryLoading && !hasAnyData && (
             <p className="font-body text-[16px] leading-[1.8] text-mute-dark">
               「入力」タブからデータを入力してください。
             </p>
           )}
-          {tab === 'charts' && hasAnyData && !selectedMonthHasData && (
+          {tab === 'charts' && !summaryLoading && hasAnyData && !selectedMonthHasData && (
             <p className="font-body text-[16px] leading-[1.8] text-mute-dark">
               {selectedMonth} のデータはまだありません。「入力」タブから登録するか、上の月から選んでください。
             </p>
           )}
-          {tab === 'charts' && selectedMonthHasData && <ChartsTab month={selectedMonth} />}
 
-          {tab === 'entry' && <EntryTab month={selectedMonth} />}
+          {tab === 'entry' && <EntryTab key={`${selectedMonth}#${dataVersion}`} month={selectedMonth} currentMonth={todayMonth} />}
           {tab === 'goal' && <GoalTab />}
           {tab === 'settings' && <SettingsTab />}
         </Container>

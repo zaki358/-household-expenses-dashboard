@@ -6,7 +6,7 @@ kind は "subscriptions" | "communications"。検証は src.repo で行う。
 from fastapi import APIRouter, Depends, HTTPException
 
 from api.deps import get_db
-from api.schemas import AmountUpdate, BundleItemCreate, IndexedBundleItem
+from api.schemas import BundleItemCreate, BundleItemUpdate, IndexedBundleItem
 from src import repo
 from src.db import Database
 
@@ -38,13 +38,13 @@ async def create_item(kind: str, payload: BundleItemCreate,
 
 
 @router.put("/{kind}/{item_id}", response_model=list[IndexedBundleItem])
-async def update_item_amount(kind: str, item_id: int, payload: AmountUpdate,
-                             db: Database = Depends(get_db)) -> list[IndexedBundleItem]:
+async def update_item(kind: str, item_id: int, payload: BundleItemUpdate,
+                      db: Database = Depends(get_db)) -> list[IndexedBundleItem]:
     _check_kind(kind)
     if not await repo.bundle_item_exists(db, item_id, kind):
         raise HTTPException(status_code=404, detail="項目が存在しません")
     try:
-        return await repo.update_bundle_amount(db, kind, item_id, payload.amount)
+        return await repo.update_bundle_item(db, kind, item_id, payload.amount, payload.name)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

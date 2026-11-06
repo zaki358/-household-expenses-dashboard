@@ -9,8 +9,10 @@ import { categoryToGroup } from './repo'
 import { normalizeMonth } from './dates'
 
 const REQUIRED_COLUMNS = ['年月', 'カテゴリ', '金額']
+// 任意列。無い CSV（従来形式）もそのまま通す。
+const NOTE_COLUMN = '備考'
 
-export interface Proposal { 行: number; 変更前年月: string; 年月: string; カテゴリ: string; 金額: number }
+export interface Proposal { 行: number; 変更前年月: string; 年月: string; カテゴリ: string; 金額: number; 備考: string }
 export interface Skipped { 行: number; 理由: string }
 export interface ImportReport {
   ok: boolean
@@ -85,6 +87,7 @@ export function analyzeEntriesCsv(bytes: Uint8Array, config: Config, today?: Dat
   const iMonth = header.indexOf('年月')
   const iCat = header.indexOf('カテゴリ')
   const iAmt = header.indexOf('金額')
+  const iNote = header.indexOf(NOTE_COLUMN)
   const mapping = categoryToGroup(config)
   const proposals: Proposal[] = []
   const skipped: Skipped[] = []
@@ -103,7 +106,8 @@ export function analyzeEntriesCsv(bytes: Uint8Array, config: Config, today?: Dat
     let after: string
     try { after = normalizeMonth(before, today) } catch { skipped.push({ 行: lineNo, 理由: `年月「${before}」を解釈できません` }); continue }
     if (!(category in mapping)) unknown.add(category)
-    proposals.push({ 行: lineNo, 変更前年月: before || '（空欄）', 年月: after, カテゴリ: category, 金額: amount })
+    const note = iNote >= 0 ? (line[iNote] ?? '').trim() : ''
+    proposals.push({ 行: lineNo, 変更前年月: before || '（空欄）', 年月: after, カテゴリ: category, 金額: amount, 備考: note })
   }
 
   return { ok: true, error: null, proposals, skipped, unknown_categories: [...unknown].sort(codePointSort) }
@@ -111,8 +115,8 @@ export function analyzeEntriesCsv(bytes: Uint8Array, config: Config, today?: Dat
 
 export async function commitEntries(db: DB, proposals: Proposal[]): Promise<number> {
   const statements: [string, unknown[]][] = proposals.map((p) => [
-    "INSERT INTO entries (month, category, amount, source) VALUES (?, ?, ?, 'import')",
-    [p.年月, p.カテゴリ, p.金額],
+    "INSERT INTO entries (month, category, amount, note, source) VALUES (?, ?, ?, ?, 'import')",
+    [p.年月, p.カテゴリ, p.金額, p.備考],
   ])
   if (statements.length) await db.batch(statements)
   return statements.length

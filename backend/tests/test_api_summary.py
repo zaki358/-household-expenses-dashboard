@@ -3,6 +3,8 @@
 in-memory DB（conftest の client / seed）で検証する。
 """
 
+from src.dates import current_month as jst_current_month
+
 _SAMPLE = [
     ("2026-01", "夫給与", 300000),
     ("2026-01", "妻給与", 200000),
@@ -31,6 +33,12 @@ def test_summary_empty_data_returns_empty_lists(client):
     assert body["months"] == []
     assert body["summary"] == []
     assert body["warnings"] == []
+
+
+def test_summary_exposes_server_current_month(client):
+    res = client.get("/api/summary")
+    assert res.status_code == 200
+    assert res.json()["current_month"] == jst_current_month()
 
 
 def test_summary_matches_known_calculation(client, seed):

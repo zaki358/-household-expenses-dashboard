@@ -35,9 +35,10 @@ def seed(db):
     """テストデータを直接投入するヘルパ。
 
     seed(entries=[(月, カテゴリ, 金額[, source]) ...],
-         bundles=[(kind, 月, 名前, 金額) ...])
+         bundles=[(kind, 月, 名前, 金額) ...],
+         months=[月, ...])  # dashboard_months に直接登録（ensure_month の恒久マーカー検証用）
     """
-    def _seed(entries=None, bundles=None):
+    def _seed(entries=None, bundles=None, months=None):
         for row in entries or []:
             month, category, amount = row[0], row[1], row[2]
             source = row[3] if len(row) > 3 else "import"
@@ -49,6 +50,10 @@ def seed(db):
             db._conn.execute(
                 "INSERT INTO bundle_items (kind, month, name, amount) VALUES (?, ?, ?, ?)",
                 (kind, month, name, amount),
+            )
+        for month in months or []:
+            db._conn.execute(
+                "INSERT OR IGNORE INTO dashboard_months (month) VALUES (?)", (month,)
             )
         db._conn.commit()
 

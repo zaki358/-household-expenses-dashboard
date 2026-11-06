@@ -35,6 +35,30 @@ def test_update_and_delete(client):
     assert res.json() == []
 
 
+def test_update_item_name(client):
+    client.post("/api/bundles/subscriptions", json={"month": "2026-06", "name": "Netflix", "amount": 1490})
+    res = client.put("/api/bundles/subscriptions/1", json={"amount": 1490, "name": "Netflix Premium"})
+    assert res.status_code == 200
+    assert res.json()[0]["名前"] == "Netflix Premium"
+
+
+def test_update_item_name_to_existing_duplicate_400(client):
+    client.post("/api/bundles/subscriptions", json={"month": "2026-06", "name": "Netflix", "amount": 1490})
+    client.post("/api/bundles/subscriptions", json={"month": "2026-06", "name": "Spotify", "amount": 980})
+    res = client.put("/api/bundles/subscriptions/2", json={"amount": 980, "name": "Netflix"})
+    assert res.status_code == 400
+
+
+def test_update_item_amount_only_keeps_name(client):
+    """amount だけの旧形式PUTで項目名が消えないこと（後方互換）。"""
+    client.post("/api/bundles/subscriptions", json={"month": "2026-06", "name": "Netflix", "amount": 1490})
+    res = client.put("/api/bundles/subscriptions/1", json={"amount": 1580})
+    assert res.status_code == 200
+    row = res.json()[0]
+    assert row["金額"] == 1580
+    assert row["名前"] == "Netflix"
+
+
 def test_subscriptions_and_communications_are_isolated(client):
     client.post("/api/bundles/subscriptions", json={"month": "2026-06", "name": "Netflix", "amount": 1490})
     client.post("/api/bundles/communications", json={"month": "2026-06", "name": "自分のスマホ", "amount": 6000})

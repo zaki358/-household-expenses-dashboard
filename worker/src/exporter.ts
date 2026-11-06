@@ -16,10 +16,10 @@ function toCsv(header: string[], rows: (string | number)[][]): string {
 }
 
 export async function exportEntriesCsv(db: DB): Promise<string> {
-  const rows = await db.all<{ month: string; category: string; amount: number }>(
-    'SELECT month, category, amount FROM entries ORDER BY month, id',
+  const rows = await db.all<{ month: string; category: string; amount: number; note: string }>(
+    'SELECT month, category, amount, note FROM entries ORDER BY month, id',
   )
-  return toCsv(['年月', 'カテゴリ', '金額'], rows.map((r) => [r.month, r.category, r.amount]))
+  return toCsv(['年月', 'カテゴリ', '金額', '備考'], rows.map((r) => [r.month, r.category, r.amount, r.note]))
 }
 
 export async function exportBundleCsv(db: DB, kind: string): Promise<string> {

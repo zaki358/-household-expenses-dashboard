@@ -16,15 +16,14 @@ from src.aggregate import (
     monthly_summary,
     previous_month,
 )
+from src.dates import current_month as jst_current_month
 from src.db import Database
 
 router = APIRouter(prefix="/api", tags=["summary"])
 
 
 async def _state(db: Database):
-    config = await repo.load_config(db)
-    rows, warnings = await repo.load_dataset(db, config)
-    months = await repo.all_months(db)
+    config, rows, warnings, months = await repo.load_state(db)
     summary = monthly_summary(rows, config, ensure_months=months)
     return config, rows, warnings, summary, months
 
@@ -41,7 +40,7 @@ def _resolve_month(months: list[str], month: str | None) -> str:
 @router.get("/summary", response_model=SummaryResponse)
 async def get_summary(db: Database = Depends(get_db)) -> SummaryResponse:
     _, _, warnings, summary, months = await _state(db)
-    return SummaryResponse(months=months, summary=summary, warnings=warnings)
+    return SummaryResponse(months=months, summary=summary, warnings=warnings, current_month=jst_current_month())
 
 
 @router.get("/dashboard", response_model=DashboardResponse)

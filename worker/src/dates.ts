@@ -49,3 +49,16 @@ export function addMonths(month: string, n: number): string {
 export function nextMonth(month: string): string {
   return addMonths(month, 1)
 }
+
+/** 「2026-02」→ 28 のように、その月の日数（うるう年考慮）を返す。 */
+export function daysInMonth(month: string): number {
+  const [y, m] = month.trim().split('-').slice(0, 2).map((x) => parseInt(x, 10))
+  // Date.UTC の日=0 は「前月の末日」。m は 1始まりなので翌月0日＝当月末日になる。
+  return new Date(Date.UTC(y, m, 0)).getUTCDate()
+}
+
+/** JST(UTC+9)基準の今月 YYYY-MM。Workerランタイムは UTC なのでオフセットを明示する。 */
+export function currentMonth(now: Date = new Date()): string {
+  const jst = new Date(now.getTime() + 9 * 60 * 60 * 1000)
+  return `${pad(jst.getUTCFullYear(), 4)}-${pad(jst.getUTCMonth() + 1, 2)}`
+}

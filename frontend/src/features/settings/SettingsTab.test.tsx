@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as client from '../../api/client'
 import type { ConfigOut } from '../../api/types'
 import { SettingsTab } from './SettingsTab'
@@ -16,6 +16,22 @@ function baseConfig(overrides: Partial<ConfigOut> = {}): ConfigOut {
     ...overrides,
   }
 }
+
+function todayMonth(): string {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+}
+
+// NextMonthSection（このタブに常に存在する）が起動時に getSummary を叩くため、
+// 個別テストで上書きしない限りの既定値を用意する。
+beforeEach(() => {
+  vi.mocked(client.getSummary).mockResolvedValue({
+    months: [],
+    summary: [],
+    warnings: [],
+    current_month: todayMonth(),
+  })
+})
 
 afterEach(() => {
   vi.resetAllMocks()
@@ -64,5 +80,90 @@ describe('SettingsTab - カテゴリ管理', () => {
     fireEvent.click(row.querySelector('button')!)
 
     expect(await screen.findByText(/夫婦の収入内訳の集計に使う特別なカテゴリ/)).toBeInTheDocument()
+  })
+})
+
+function shiftMonth(base: string, n: number): string {
+  const [y, m] = base.split('-').map(Number)
+  const d = new Date(y, m - 1 + n, 1)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+}
+
+describe('SettingsTab - 月削除', () => {
+  it('今月・過去月は削除候補に出ない', async () => {
+    const today = todayMonth()
+    const past = shiftMonth(today, -1)
+    const future = shiftMonth(today, 1)
+    vi.mocked(client.getGoals).mockResolvedValue([])
+    vi.mocked(client.getConfig).mockResolvedValue(baseConfig())
+    vi.mocked(client.getSummary).mockResolvedValue({
+      months: [past, today, future],
+      summary: [],
+      warnings: [],
+      current_month: today,
+    })
+
+    render(<SettingsTab />)
+
+    await screen.findByText(future)
+    expect(screen.queryByText(today)).toBeNull()
+    expect(screen.queryByText(past)).toBeNull()
+  })
+
+  it('削除できる月が無ければその旨を表示する', async () => {
+    vi.mocked(client.getGoals).mockResolvedValue([])
+    vi.mocked(client.getConfig).mockResolvedValue(baseConfig())
+    vi.mocked(client.getSummary).mockResolvedValue({
+      months: [todayMonth()],
+      summary: [],
+      warnings: [],
+      current_month: todayMonth(),
+    })
+
+    render(<SettingsTab />)
+
+    expect(await screen.findByText('削除できる月はありません。')).toBeInTheDocument()
+  })
+
+  it('月名を打ち込むまで削除ボタンが無効', async () => {
+    const future = shiftMonth(todayMonth(), 1)
+    vi.mocked(client.getGoals).mockResolvedValue([])
+    vi.mocked(client.getConfig).mockResolvedValue(baseConfig())
+    vi.mocked(client.getSummary).mockResolvedValue({
+      months: [future],
+      summary: [],
+      warnings: [],
+      current_month: todayMonth(),
+    })
+
+    render(<SettingsTab />)
+
+    fireEvent.click(await screen.findByText(future))
+    const deleteButton = await screen.findByRole('button', { name: '削除する' })
+    expect(deleteButton).toBeDisabled()
+  })
+
+  it('打ち込んで削除すると deleteMonth が呼ばれる', async () => {
+    const future = shiftMonth(todayMonth(), 1)
+    vi.mocked(client.getGoals).mockResolvedValue([])
+    vi.mocked(client.getConfig).mockResolvedValue(baseConfig())
+    vi.mocked(client.getSummary).mockResolvedValue({
+      months: [future],
+      summary: [],
+      warnings: [],
+      current_month: todayMonth(),
+    })
+    vi.mocked(client.deleteMonth).mockResolvedValue({ month: future, deleted_entries: 0, deleted_bundle_items: 0 })
+
+    render(<SettingsTab />)
+
+    fireEvent.click(await screen.findByText(future))
+    const input = screen.getByPlaceholderText(future)
+    fireEvent.change(input, { target: { value: future } })
+    const deleteButton = screen.getByRole('button', { name: '削除する' })
+    expect(deleteButton).not.toBeDisabled()
+    fireEvent.click(deleteButton)
+
+    await waitFor(() => expect(client.deleteMonth).toHaveBeenCalledWith(future))
   })
 })

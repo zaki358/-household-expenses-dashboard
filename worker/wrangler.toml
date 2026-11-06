@@ -15,6 +15,17 @@ database_name = "kakei-db"
 database_id = "bfab2bb8-68e9-4800-a4d8-715c97c182d0"
 migrations_dir = "migrations"
 
+# 割り勘アプリ(warikan Worker)への Service Binding。
+# Cloudflare のエッジを通らず Worker を直接呼ぶため、割り勘側の Cloudflare Access に
+# 阻まれない。認証は代わりに共有トークン WARIKAN_INTERNAL_TOKEN で行う。
+#
+# 連携をやめたいときは、この3行をコメントアウトするか
+# `wrangler secret delete WARIKAN_INTERNAL_TOKEN` してから再デプロイすれば、
+# 反映ボタンは画面から消え、連携前とまったく同じ挙動に戻る。
+[[services]]
+binding = "WARIKAN"
+service = "warikan"
+
 # 単一ホスト名構成: フロント(frontend/dist)を同じWorkerから配信し、
 # /api/* だけ Worker(Hono) を先に走らせる。それ以外は SPA フォールバック。
 [assets]
@@ -22,6 +33,14 @@ directory = "../frontend/dist"
 not_found_handling = "single-page-application"
 run_worker_first = ["/api/*"]
 
-# Access 許可メール（多層防御 access guard 用）。登録後に設定:
+# Access 許可メール（多層防御 access guard 用）。実値はここに書かず、
+# `wrangler secret put ACCESS_ALLOWED_EMAILS` でCloudflare側に暗号化登録する
+# （Publicリポジトリのため平文コミットを避ける）。ローカル開発は worker/.dev.vars で空文字に上書き。
 # [vars]
 # ACCESS_ALLOWED_EMAILS = "you@example.com,wife@example.com"
+
+# 割り勘アプリの内部API用の共有トークン。実値はここに書かず
+# `wrangler secret put WARIKAN_INTERNAL_TOKEN` で登録する
+# （割り勘側の INTERNAL_API_TOKEN と同じ値にする）。
+# 未設定なら連携は無効になり、反映ボタンは表示されない。
+# ローカル開発は worker/.dev.vars で設定する。

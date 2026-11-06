@@ -56,9 +56,37 @@ def test_export_entries_csv(client, seed):
     assert res.status_code == 200
     assert res.headers["content-type"].startswith("text/csv")
     text = res.content.decode("utf-8-sig")
-    assert text.splitlines()[0] == "年月,カテゴリ,金額"
-    assert "2026-05,食費,1200" in text
-    assert "2026-05,家賃,85000" in text
+    assert text.splitlines()[0] == "年月,カテゴリ,金額,備考"
+    assert "2026-05,食費,1200," in text
+    assert "2026-05,家賃,85000," in text
+
+
+def test_export_entries_csv_includes_note(client):
+    client.post("/api/entries", json={"month": "2026-05", "category": "消耗品", "amount": 3200, "note": "洗剤"})
+    res = client.get("/api/export/entries.csv")
+    text = res.content.decode("utf-8-sig")
+    assert "2026-05,消耗品,3200,洗剤" in text
+
+
+def test_import_csv_with_note_column(client):
+    csv = (
+        "年月,カテゴリ,金額,備考\n"
+        "2026-05,消耗品,3200,洗剤\n"
+    ).encode("utf-8-sig")
+    res = client.post("/api/import/csv", params={"dry_run": False}, content=csv)
+    assert res.status_code == 200
+    entries = client.get("/api/entries", params={"month": "2026-05"}).json()
+    assert entries == []  # import分は list_entries(manual限定)には出ない
+    # 書き出しCSVで備考が保持されていることを確認する
+    exported = client.get("/api/export/entries.csv").content.decode("utf-8-sig")
+    assert "2026-05,消耗品,3200,洗剤" in exported
+
+
+def test_import_csv_without_note_column_still_works(client):
+    """従来形式（備考列なし）のCSVもエラーにならず通る。"""
+    res = client.post("/api/import/csv", params={"dry_run": True}, content=CSV)
+    assert res.status_code == 200
+    assert res.json()["ok"] is True
 
 
 def test_export_bundle_csv(client, seed):

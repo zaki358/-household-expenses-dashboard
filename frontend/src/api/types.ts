@@ -23,6 +23,7 @@ export interface SummaryResponse {
   months: string[]
   summary: MonthlySummaryRow[]
   warnings: string[]
+  current_month: string
 }
 
 export interface ComparisonRow {
@@ -64,6 +65,22 @@ export interface IndexedEntry {
   年月: string
   カテゴリ: string
   金額: number
+  備考: string
+  // その月の何日か（変動費・車・バイク・投資で任意入力）。null/未設定は日付なし。
+  日?: number | null
+  // 割り勘アプリへ反映済みの場合、その支出ID。null/未設定は未反映。
+  割り勘ID?: string | null
+}
+
+/** 割り勘アプリ側のユーザー（支払者の候補）。 */
+export interface WarikanUser {
+  user_id: string
+  display_name: string
+}
+
+/** 割り勘連携が使える状態かどうか。false なら反映ボタンは出さない。 */
+export interface WarikanStatus {
+  enabled: boolean
 }
 
 export interface IndexedBundleItem {
@@ -103,6 +120,7 @@ export interface ImportProposal {
   年月: string
   カテゴリ: string
   金額: number
+  備考: string
 }
 
 export interface ImportSkipped {
@@ -118,4 +136,18 @@ export interface ImportReport {
   unknown_categories: string[]
   dry_run: boolean
   committed: number
+}
+
+export interface MonthDeleteResponse {
+  month: string
+  deleted_entries: number
+  deleted_bundle_items: number
+}
+
+export interface EnsureMonthResponse {
+  month: string
+  created: boolean
+  base: string | null
+  carried_entries: number
+  carried_bundle_items: number
 }

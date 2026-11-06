@@ -2,12 +2,16 @@ import type {
   ChartsResponse,
   ConfigOut,
   DashboardResponse,
+  EnsureMonthResponse,
   Goal,
   GoalStatus,
   ImportReport,
   IndexedBundleItem,
   IndexedEntry,
+  MonthDeleteResponse,
   SummaryResponse,
+  WarikanStatus,
+  WarikanUser,
 } from './types'
 
 export class ApiError extends Error {
@@ -69,12 +73,40 @@ export function getEntries(month?: string, group?: string): Promise<IndexedEntry
   return getJson<IndexedEntry[]>(`/api/entries${qs ? `?${qs}` : ''}`)
 }
 
-export function createEntry(month: string, category: string, amount: number): Promise<IndexedEntry[]> {
-  return mutateJson<IndexedEntry[]>('POST', '/api/entries', { month, category, amount })
+// day: その月の何日か。undefined は送らない（サーバー側で「触らない」）、null は「日付なし／クリア」。
+export function createEntry(
+  month: string, category: string, amount: number, note?: string, day?: number | null,
+): Promise<IndexedEntry[]> {
+  return mutateJson<IndexedEntry[]>('POST', '/api/entries', { month, category, amount, note, day })
+}
+
+export function updateEntry(
+  id: number, amount: number, category?: string, note?: string, day?: number | null,
+): Promise<IndexedEntry[]> {
+  return mutateJson<IndexedEntry[]>('PUT', `/api/entries/${id}`, { amount, category, note, day })
 }
 
 export function deleteEntry(id: number): Promise<IndexedEntry[]> {
   return mutateJson<IndexedEntry[]>('DELETE', `/api/entries/${id}`)
+}
+
+// 割り勘アプリ連携
+// 本番(Worker)専用の機能。ローカルのFastAPIには該当ルートが無いため、
+// getWarikanStatus は404になる。呼び出し側は失敗を「連携なし」として扱う。
+export function getWarikanStatus(): Promise<WarikanStatus> {
+  return getJson<WarikanStatus>('/api/warikan/status')
+}
+
+export function getWarikanUsers(): Promise<WarikanUser[]> {
+  return getJson<WarikanUser[]>('/api/warikan/users')
+}
+
+export function reflectToWarikan(id: number, paidBy: string): Promise<IndexedEntry[]> {
+  return mutateJson<IndexedEntry[]>('POST', `/api/entries/${id}/warikan`, { paid_by: paidBy })
+}
+
+export function cancelWarikanReflect(id: number): Promise<IndexedEntry[]> {
+  return mutateJson<IndexedEntry[]>('DELETE', `/api/entries/${id}/warikan`)
 }
 
 // Bundles
@@ -90,6 +122,10 @@ export function createBundleItem(
   amount: number,
 ): Promise<IndexedBundleItem[]> {
   return mutateJson<IndexedBundleItem[]>('POST', `/api/bundles/${kind}`, { month, name, amount })
+}
+
+export function updateBundleItem(kind: string, id: number, amount: number, name?: string): Promise<IndexedBundleItem[]> {
+  return mutateJson<IndexedBundleItem[]>('PUT', `/api/bundles/${kind}/${id}`, { amount, name })
 }
 
 export function deleteBundleItem(kind: string, id: number): Promise<IndexedBundleItem[]> {
@@ -137,6 +173,14 @@ export function deleteCategory(name: string): Promise<ConfigOut> {
 // Months
 export function createNextMonth(): Promise<{ month: string }> {
   return mutateJson<{ month: string }>('POST', '/api/months/next')
+}
+
+export function ensureCurrentMonth(): Promise<EnsureMonthResponse> {
+  return mutateJson<EnsureMonthResponse>('POST', '/api/months/ensure-current')
+}
+
+export function deleteMonth(month: string): Promise<MonthDeleteResponse> {
+  return mutateJson<MonthDeleteResponse>('DELETE', `/api/months/${encodeURIComponent(month)}`)
 }
 
 // CSV 取込・書き出し

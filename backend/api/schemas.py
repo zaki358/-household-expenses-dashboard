@@ -24,6 +24,7 @@ class SummaryResponse(BaseModel):
     months: list[str]
     summary: list[MonthlySummaryRow]
     warnings: list[str]
+    current_month: str
 
 
 class ComparisonRow(BaseModel):
@@ -65,16 +66,31 @@ class IndexedEntry(BaseModel):
     年月: str
     カテゴリ: str
     金額: int
+    備考: str
+    日: int | None = None
+    # 割り勘アプリへの反映先の支出ID（未反映は None）。反映操作は Worker 専用。
+    割り勘ID: str | None = None
 
 
 class EntryCreate(BaseModel):
     month: str
     category: str
     amount: int
+    note: str = ""
+    day: int | None = None
 
 
-class AmountUpdate(BaseModel):
+class EntryUpdate(BaseModel):
     amount: int
+    category: str | None = None
+    note: str | None = None
+    # 未送信なら日付に触らない／null を明示的に送ったらクリア（router で model_fields_set を見て区別する）
+    day: int | None = None
+
+
+class BundleItemUpdate(BaseModel):
+    amount: int
+    name: str | None = None
 
 
 class IndexedBundleItem(BaseModel):
@@ -118,6 +134,20 @@ class GoalStatus(BaseModel):
 
 class NextMonthResponse(BaseModel):
     month: str
+
+
+class EnsureMonthResponse(BaseModel):
+    month: str
+    created: bool
+    base: str | None
+    carried_entries: int
+    carried_bundle_items: int
+
+
+class MonthDeleteResponse(BaseModel):
+    month: str
+    deleted_entries: int
+    deleted_bundle_items: int
 
 
 class InvestmentModeUpdate(BaseModel):

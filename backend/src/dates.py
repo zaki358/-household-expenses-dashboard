@@ -5,7 +5,8 @@ Cloudflare Python Workers では pandas が使えないため、月の計算を
 と一致させる。
 """
 
-from datetime import date
+import calendar
+from datetime import date, datetime, timedelta, timezone
 
 
 def _is_blank(value) -> bool:
@@ -52,3 +53,25 @@ def add_months(month: str, n: int) -> str:
 def next_month(month: str) -> str:
     """「2026-06」→「2026-07」のように翌月を返す。"""
     return add_months(month, 1)
+
+
+def days_in_month(month: str) -> int:
+    """「2026-02」→ 28 のように、その月の日数（うるう年考慮）を返す。"""
+    year, mon = (int(x) for x in str(month).strip().split("-")[:2])
+    return calendar.monthrange(year, mon)[1]
+
+
+def current_month(now: datetime | None = None) -> str:
+    """JST(UTC+9)基準の今月 YYYY-MM。
+
+    TypeScript版（worker/src/dates.ts の currentMonth）と挙動を揃える。
+    Worker は UTC で動くため明示的にオフセットする必要があり、こちらも
+    now を UTC とみなして +9時間する（naive な now は UTC 扱い）。
+    テストでは UTC 15:00（= JST 翌日 00:00）のような日付境界ケースを
+    now に渡して検証できる。
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    base = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    jst = base.astimezone(timezone.utc) + timedelta(hours=9)
+    return f"{jst.year:04d}-{jst.month:02d}"
